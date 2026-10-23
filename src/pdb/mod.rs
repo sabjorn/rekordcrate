@@ -150,6 +150,8 @@ pub trait RowVariant {
     fn from_row(row: &Row) -> Option<&Self>;
     /// Extracts a mutable reference to this row variant from a generic `Row`.
     fn from_row_mut(row: &mut Row) -> Option<&mut Self>;
+    /// Wraps this row variant in a generic `Row`.
+    fn into_row(self) -> Row;
 }
 
 /// Points to a table page and can be used to calculate the page's file offset by multiplying it
@@ -604,7 +606,7 @@ impl Page {
                 unknown2: 0,
                 packed_row_counts: PackedRowCounts::from_all_valid(0),
                 page_flags: PageFlags::new_data_page(),
-                free_size: DataPageContent::page_heap_size(page_size) as u16,
+                free_size: Self::empty_page_heap_size(page_size),
                 used_size: 0,
             },
             content: PageContent::Data(DataPageContent {
@@ -620,6 +622,19 @@ impl Page {
         }
     }
 
+    /// Page heap space consumed by allocating a row occupying `bytes` bytes.
+    ///
+    /// This includes the row offset in the page footer and, in the worst case, the header of a
+    /// new row group, so it is an upper bound on the space the allocation needs.
+    pub(crate) fn heap_bytes_for_row(bytes: u16) -> u16 {
+        bytes.next_multiple_of(4) + RowGroup::HEADER_SIZE + RowGroup::OFFSET_SIZE
+    }
+
+    /// Page heap space available for rows in an empty page of the given size.
+    pub(crate) fn empty_page_heap_size(page_size: u32) -> u16 {
+        DataPageContent::page_heap_size(page_size) as u16
+    }
+
     /// Allocate space for a new row in the page heap and return a function to
     /// insert the row at the allocated offset. Returns `None` if there is
     /// insufficient free space in the page.
@@ -630,11 +645,10 @@ impl Page {
         match self.content {
             PageContent::Index(_) => None,
             PageContent::Data(ref mut dpc) => {
+                // Assume the upper bound of required space.
+                let required_bytes = Self::heap_bytes_for_row(bytes);
                 // Always align rows to 4 bytes.
                 let bytes = bytes.next_multiple_of(4);
-
-                // Assume the upper bound of required space.
-                let required_bytes = bytes + RowGroup::HEADER_SIZE + RowGroup::OFFSET_SIZE;
                 if self.header.free_size < required_bytes {
                     return None;
                 }
@@ -1111,6 +1125,9 @@ impl RowVariant for Album {
             _ => None,
         }
     }
+    fn into_row(self) -> Row {
+        Row::Plain(PlainRow::Album(self))
+    }
 }
 
 impl PageHeapObject for Album {
@@ -1164,6 +1181,9 @@ impl RowVariant for Artist {
             _ => None,
         }
     }
+    fn into_row(self) -> Row {
+        Row::Plain(PlainRow::Artist(self))
+    }
 }
 
 impl PageHeapObject for Artist {
@@ -1207,6 +1227,9 @@ impl RowVariant for Artwork {
             Row::Plain(PlainRow::Artwork(row)) => Some(row),
             _ => None,
         }
+    }
+    fn into_row(self) -> Row {
+        Row::Plain(PlainRow::Artwork(self))
     }
 }
 
@@ -1255,6 +1278,9 @@ impl RowVariant for Color {
             _ => None,
         }
     }
+    fn into_row(self) -> Row {
+        Row::Plain(PlainRow::Color(self))
+    }
 }
 
 impl PageHeapObject for Color {
@@ -1299,6 +1325,9 @@ impl RowVariant for Genre {
             _ => None,
         }
     }
+    fn into_row(self) -> Row {
+        Row::Plain(PlainRow::Genre(self))
+    }
 }
 
 impl PageHeapObject for Genre {
@@ -1339,6 +1368,9 @@ impl RowVariant for HistoryPlaylist {
             Row::Plain(PlainRow::HistoryPlaylist(row)) => Some(row),
             _ => None,
         }
+    }
+    fn into_row(self) -> Row {
+        Row::Plain(PlainRow::HistoryPlaylist(self))
     }
 }
 
@@ -1382,6 +1414,9 @@ impl RowVariant for HistoryEntry {
             Row::Plain(PlainRow::HistoryEntry(row)) => Some(row),
             _ => None,
         }
+    }
+    fn into_row(self) -> Row {
+        Row::Plain(PlainRow::HistoryEntry(self))
     }
 }
 
@@ -1460,6 +1495,9 @@ impl RowVariant for History {
             _ => None,
         }
     }
+    fn into_row(self) -> Row {
+        Row::Plain(PlainRow::History(self))
+    }
 }
 
 /// Represents a musical key.
@@ -1490,6 +1528,9 @@ impl RowVariant for Key {
             Row::Plain(PlainRow::Key(row)) => Some(row),
             _ => None,
         }
+    }
+    fn into_row(self) -> Row {
+        Row::Plain(PlainRow::Key(self))
     }
 }
 
@@ -1532,6 +1573,9 @@ impl RowVariant for Label {
             Row::Plain(PlainRow::Label(row)) => Some(row),
             _ => None,
         }
+    }
+    fn into_row(self) -> Row {
+        Row::Plain(PlainRow::Label(self))
     }
 }
 
@@ -1581,6 +1625,9 @@ impl RowVariant for PlaylistTreeNode {
             Row::Plain(PlainRow::PlaylistTreeNode(row)) => Some(row),
             _ => None,
         }
+    }
+    fn into_row(self) -> Row {
+        Row::Plain(PlainRow::PlaylistTreeNode(self))
     }
 }
 
@@ -1637,6 +1684,9 @@ impl RowVariant for PlaylistEntry {
             _ => None,
         }
     }
+    fn into_row(self) -> Row {
+        Row::Plain(PlainRow::PlaylistEntry(self))
+    }
 }
 
 impl PageHeapObject for PlaylistEntry {
@@ -1690,6 +1740,9 @@ impl RowVariant for ColumnEntry {
             Row::Plain(PlainRow::ColumnEntry(row)) => Some(row),
             _ => None,
         }
+    }
+    fn into_row(self) -> Row {
+        Row::Plain(PlainRow::ColumnEntry(self))
     }
 }
 
@@ -1904,6 +1957,9 @@ impl RowVariant for Track {
             _ => None,
         }
     }
+    fn into_row(self) -> Row {
+        Row::Plain(PlainRow::Track(self))
+    }
 }
 
 impl PageHeapObject for Track {
@@ -2034,6 +2090,9 @@ impl RowVariant for Menu {
             Row::Plain(PlainRow::Menu(row)) => Some(row),
             _ => None,
         }
+    }
+    fn into_row(self) -> Row {
+        Row::Plain(PlainRow::Menu(self))
     }
 }
 
