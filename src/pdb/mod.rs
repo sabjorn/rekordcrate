@@ -579,6 +579,47 @@ pub struct Page {
 }
 
 impl Page {
+    /// Create an empty data page that can hold rows of the given page type.
+    ///
+    /// The whole page heap is marked as free, so the page is ready to have rows
+    /// allocated into it via [`Page::allocate_row`].
+    ///
+    /// `next_page` should point at the following page in the table's page chain,
+    /// or past the end of the file if this page is the last one of its table.
+    /// `sequence` is the database sequence number at the time the page is created.
+    #[must_use]
+    pub fn new_empty_data(
+        page_index: PageIndex,
+        page_type: PageType,
+        next_page: PageIndex,
+        page_size: u32,
+        sequence: u32,
+    ) -> Self {
+        Self {
+            header: PageHeader {
+                page_index,
+                page_type,
+                next_page,
+                unknown1: sequence,
+                unknown2: 0,
+                packed_row_counts: PackedRowCounts::from_all_valid(0),
+                page_flags: PageFlags::new_data_page(),
+                free_size: DataPageContent::page_heap_size(page_size) as u16,
+                used_size: 0,
+            },
+            content: PageContent::Data(DataPageContent {
+                header: DataPageHeader {
+                    unknown5: 0,
+                    unknown_not_num_rows_large: 0,
+                    unknown6: 0,
+                    unknown7: 0,
+                },
+                row_groups: Vec::new(),
+                rows: BTreeMap::new(),
+            }),
+        }
+    }
+
     /// Allocate space for a new row in the page heap and return a function to
     /// insert the row at the allocated offset. Returns `None` if there is
     /// insufficient free space in the page.
