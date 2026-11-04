@@ -595,17 +595,32 @@ fn library(
         selected.push(playlist.clone());
     }
 
-    let mut writer = DeviceExportWriter::create(output, &today())?;
+    // An export that is already there is added to, so that a playlist that has grown does not
+    // mean copying everything again.
+    let existing = ExportLayout::new(output.to_path_buf())
+        .export_pdb()
+        .is_file();
+    let mut writer = if existing {
+        println!("adding to the export already in {}", output.display());
+        DeviceExportWriter::open(output)?
+    } else {
+        DeviceExportWriter::create(output, &today())?
+    };
     let layout = writer.layout().clone();
     let contents = layout.root().join("Contents");
     std::fs::create_dir_all(&contents)?;
 
     let mut missing_audio = 0usize;
     let mut without_analysis = 0usize;
+    let mut added = 0usize;
+    let mut already_there = 0usize;
     for playlist in &selected {
         let tracks = library.playlist_tracks(playlist.id);
+        let playlist_id = match writer.playlist_by_name(&playlist.name) {
+            Some(playlist_id) => playlist_id,
+            None => writer.create_playlist(None, &playlist.name)?,
+        };
         println!("{}: {} tracks", playlist.name, tracks.len());
-        let playlist_id = writer.create_playlist(None, &playlist.name)?;
 
         for track in tracks {
             let source = Path::new(&track.file_path);
@@ -618,7 +633,12 @@ fn library(
             // The path the track has on the device, which is also what decides where its
             // analysis files belong.
             let device_path = format!("/Contents/{}", track.filename);
-            std::fs::copy(source, contents.join(&track.filename))?;
+            let destination = contents.join(&track.filename);
+            // A file that is already on the device is left alone, which is what makes adding to
+            // an export cheap.
+            if !destination.is_file() {
+                std::fs::copy(source, destination)?;
+            }
 
             // The artwork keeps the place it has in the library, so that the path recorded for
             // it is the one the player finds it at.
@@ -634,6 +654,9 @@ fn library(
                     .and_then(|extension| extension.to_str())
                     .unwrap_or("DAT");
                 let destination = layout.anlz_file_for_audio(&device_path, extension);
+                if destination.is_file() {
+                    continue;
+                }
                 if let Some(dir) = destination.parent() {
                     std::fs::create_dir_all(dir)?;
                 }
@@ -670,12 +693,17 @@ fn library(
                 file_type: track.file_type.clone(),
                 ..Default::default()
             })?;
-            writer.add_track_to_playlist(playlist_id, track_id)?;
+            if writer.add_track_to_playlist(playlist_id, track_id)? {
+                added += 1;
+            } else {
+                already_there += 1;
+            }
         }
     }
     writer.close()?;
 
     println!("wrote an export to {}", output.display());
+    println!("{added} tracks added, {already_there} already on the device");
     if missing_audio > 0 {
         println!("{missing_audio} tracks were left out, as their audio file was not there");
     }
@@ -702,6 +730,9 @@ fn copy_artwork(
         return Ok(String::new());
     };
     let destination = layout.artwork_dir().join(below_artwork.1);
+    if destination.is_file() {
+        return Ok(format!("/PIONEER/Artwork/{}", below_artwork.1));
+    }
     if let Some(dir) = destination.parent() {
         std::fs::create_dir_all(dir)?;
     }
