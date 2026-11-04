@@ -616,9 +616,12 @@ fn library(
     let mut already_there = 0usize;
     for playlist in &selected {
         let tracks = library.playlist_tracks(playlist.id);
-        let playlist_id = match writer.playlist_by_name(&playlist.name) {
+        // The folders the playlist sits in are put on the device as well, so that it is found
+        // where it is in the library.
+        let parent = create_folders_of(&mut writer, &library, playlist)?;
+        let playlist_id = match writer.playlist_by_name(parent, &playlist.name) {
             Some(playlist_id) => playlist_id,
-            None => writer.create_playlist(None, &playlist.name)?,
+            None => writer.create_playlist(parent, &playlist.name)?,
         };
         println!("{}: {} tracks", playlist.name, tracks.len());
 
@@ -711,6 +714,37 @@ fn library(
         println!("{without_analysis} tracks have no analysis files in the library");
     }
     Ok(())
+}
+
+/// Puts the folders that hold a playlist in the library on the device, and returns the one the
+/// playlist belongs in.
+///
+/// A folder that is already on the device is used as it is, so that two playlists from the same
+/// folder end up beside each other rather than in a folder each.
+fn create_folders_of(
+    writer: &mut DeviceExportWriter,
+    library: &Library,
+    playlist: &rekordcrate::edb::LibraryPlaylist,
+) -> CliResult<Option<rekordcrate::pdb::PlaylistTreeNodeId>> {
+    // Walk up to the root of the tree, which gives the folders from the innermost outwards.
+    let mut names = Vec::new();
+    let mut parent_id = playlist.parent_id;
+    while parent_id != 0 {
+        let Some(folder) = library.playlist_by_id(parent_id) else {
+            break;
+        };
+        names.push(folder.name.clone());
+        parent_id = folder.parent_id;
+    }
+
+    let mut parent = None;
+    for name in names.into_iter().rev() {
+        parent = Some(match writer.playlist_by_name(parent, &name) {
+            Some(folder) => folder,
+            None => writer.create_playlist_folder(parent, &name)?,
+        });
+    }
+    Ok(parent)
 }
 
 /// Copies the artwork of a track to a device, and returns the path it has there.
