@@ -4,3 +4,4 @@
 /data/*/Contents/**/*.mp3
 # KUVO profile files (because they apparently contain a key?)
 /data/*/PIONEER/djprofile.nxs
+backups/
