@@ -10,7 +10,9 @@ use binrw::BinRead;
 use binrw::BinWrite;
 use clap::{Parser, Subcommand, ValueEnum};
 use fallible_iterator::FallibleIterator;
-use rekordcrate::device::{get_playlists, DeviceExportWriter, ExportLayout, Track as DeviceTrack};
+use rekordcrate::device::{
+    get_playlists, DeviceExportWriter, ExportLayout, Tag as DeviceTag, Track as DeviceTrack,
+};
 use rekordcrate::edb::Library;
 use rekordcrate::pdb::io::Database;
 use rekordcrate::pdb::*;
@@ -639,15 +641,35 @@ fn library(
     let existing = ExportLayout::new(output.to_path_buf())
         .export_pdb()
         .is_file();
+    // An export holds the tag set of the library it comes from, with the ids that library uses,
+    // so that the tags a track carries name the same rows.
+    let tags: Vec<DeviceTag> = library
+        .tags()
+        .iter()
+        .map(|tag| DeviceTag {
+            id: tag.id,
+            parent_id: tag.parent_id,
+            name: tag.name.clone(),
+            position: tag.position,
+            is_category: tag.is_category,
+        })
+        .collect();
+
     let mut writer = if existing {
         println!("adding to the export already in {}", output.display());
         DeviceExportWriter::open(output)?
-    } else {
+    } else if tags.is_empty() {
         DeviceExportWriter::create(output, &today())?
+    } else {
+        DeviceExportWriter::create_with_tags(output, &today(), &tags)?
     };
     let layout = writer.layout().clone();
-    let contents = layout.root().join("Contents");
-    std::fs::create_dir_all(&contents)?;
+
+    // Rekordbox carries the profile of the DJ over to a device, so an export from a library
+    // holding one carries it as well.
+    if let Some(profile) = library.profile_file() {
+        copy_unless_present(&profile, &layout.dj_profile())?;
+    }
 
     let mut missing_audio = 0usize;
     let mut without_analysis = 0usize;
@@ -673,7 +695,11 @@ fn library(
                 continue;
             }
 
-            let destination = contents.join(&track.filename);
+            // Rekordbox holds the audio of a track under the artist and the album it names.
+            let destination = layout.contents_file(&track.artist, &track.album, &track.filename);
+            if let Some(dir) = destination.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
             // A file that is already on the device is left alone, which is what makes adding to
             // an export cheap.
             let was_there = destination.is_file();
@@ -687,15 +713,14 @@ fn library(
 
             // The path the track has on the device, which is also what decides where its
             // analysis files belong.
-            let name = match name_form {
-                NameForm::Device => stored_name(&destination)?,
-                NameForm::Library => track.filename.clone(),
+            let on_device = match name_form {
+                NameForm::Device => destination.with_file_name(stored_name(&destination)?),
+                NameForm::Library => destination.clone(),
             };
-            let device_path = format!("/Contents/{name}");
-
-            // The artwork keeps the place it has in the library, so that the path recorded for
-            // it is the one the player finds it at.
-            let artwork_path = copy_artwork(&library, track, &layout)?;
+            let device_path = on_device
+                .strip_prefix(layout.root())
+                .map(|path| format!("/{}", path.display()))
+                .unwrap_or_default();
 
             let analysis = library.analysis_files(track);
             if analysis.is_empty() {
@@ -719,12 +744,13 @@ fn library(
                 title: track.title.clone(),
                 artist: track.artist.clone(),
                 album: track.album.clone(),
+                album_artist: track.album_artist.clone(),
                 genre: track.genre.clone(),
                 label: track.label.clone(),
                 comment: track.comment.clone(),
                 date_added: track.date_added.clone(),
                 analyze_date: track.analyze_date.clone(),
-                artwork_path,
+                artwork_path: track.artwork_path.clone(),
                 analyze_path: analysis_dir
                     .join(format!("{stem}.DAT"))
                     .strip_prefix(layout.root())
@@ -740,10 +766,20 @@ fn library(
                 disc_number: track.disc_number,
                 year: track.year,
                 rating: track.rating,
+                play_count: track.play_count,
                 color: track.color.clone(),
                 file_type: track.file_type.clone(),
                 ..Default::default()
             })?;
+            // The export decides where the artwork of a track belongs, so it is copied once the
+            // track has been added and the image has been given a name.
+            copy_artwork(&library, track, &writer)?;
+
+            // The tags of a track name rows of the set written with the export.
+            for tag in library.tags_of_track(track.id) {
+                writer.add_tag_to_track(track_id, rekordcrate::pdb::ext::TagId(*tag))?;
+            }
+
             if writer.add_track_to_playlist(playlist_id, track_id)? {
                 added += 1;
             } else {
@@ -854,41 +890,36 @@ fn create_folders_of(
     Ok(parent)
 }
 
-/// Copies the artwork of a track to a device, and returns the path it has there.
+/// Copies the artwork of a track to the place the export holds it.
 ///
 /// Players look for the artwork of a track at the path the database records, alongside which they
-/// expect the larger version that Rekordbox writes beside it, so both are copied to the place
-/// below `PIONEER/Artwork` that they have in the library.
+/// expect the larger version that Rekordbox writes beside it, so both are copied.
 fn copy_artwork(
     library: &Library,
     track: &rekordcrate::edb::LibraryTrack,
-    layout: &ExportLayout,
-) -> CliResult<String> {
+    writer: &DeviceExportWriter,
+) -> CliResult<()> {
     let Some(source) = library.file_below_pioneer(&track.artwork_path) else {
-        return Ok(String::new());
+        return Ok(());
     };
-    let Some(below_artwork) = track.artwork_path.split_once("PIONEER/Artwork/") else {
-        return Ok(String::new());
+    let Some(destination) = writer.artwork_file(&track.artwork_path) else {
+        return Ok(());
     };
-    let destination = layout.artwork_dir().join(below_artwork.1);
     copy_unless_present(&source, &destination)?;
 
-    // Rekordbox keeps further versions of the same image beside it, which players look for by
+    // Rekordbox keeps a larger version of the same image beside it, which players look for by
     // name rather than through the database.
-    for suffix in ["_m", "_s"] {
-        let beside = |path: &Path| -> Option<PathBuf> {
-            let stem = path.file_stem()?.to_str()?;
-            let extension = path.extension()?.to_str()?;
-            Some(path.with_file_name(format!("{stem}{suffix}.{extension}")))
-        };
-        if let (Some(from), Some(to)) = (beside(&source), beside(&destination)) {
-            if from.is_file() {
-                copy_unless_present(&from, &to)?;
-            }
+    let beside = |path: &Path| -> Option<PathBuf> {
+        let stem = path.file_stem()?.to_str()?;
+        let extension = path.extension()?.to_str()?;
+        Some(path.with_file_name(format!("{stem}_m.{extension}")))
+    };
+    if let (Some(from), Some(to)) = (beside(&source), beside(&destination)) {
+        if from.is_file() {
+            copy_unless_present(&from, &to)?;
         }
     }
-
-    Ok(format!("/PIONEER/Artwork/{}", below_artwork.1))
+    Ok(())
 }
 
 /// Collects the playlists that a node of the playlist tree stands for.

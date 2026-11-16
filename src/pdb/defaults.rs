@@ -161,12 +161,6 @@ const TAGS: [(Option<u32>, u32, u32, bool, &str); 28] = [
     (Some(4), 0, 701802348, false, "My Comment"),
 ];
 
-/// Subtype of the tag rows that Rekordbox writes, which selects 8-bit string offsets.
-const TAG_SUBTYPE: u16 = 1664;
-
-/// Value of the field that marks a tag row as holding a category.
-const TAG_IS_CATEGORY: u32 = 0x0100_0000;
-
 /// The single row of the not understood ext table, which is the same in every known export.
 const UNKNOWN7: [u8; Unknown7::BINARY_SIZE as usize] = [
     0x00, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -287,12 +281,58 @@ pub fn insert_defaults<IO: Read + Seek>(
     Ok(())
 }
 
+/// Adds a tag, or a category holding tags, with the id it is given.
+///
+/// An export holds the tag set of the library it came from, keeping the ids of that library, so
+/// a tag is written with the id it already has.
+pub fn insert_tag<IO: Read + Seek>(
+    db: &mut Database<IO>,
+    id: u32,
+    parent_id: u32,
+    position: u32,
+    is_category: bool,
+    name: &str,
+) -> RekordcrateResult<()> {
+    db.add_row_with_slack(
+        TagOrCategory {
+            subtype: Subtype(TagOrCategory::SUBTYPE),
+            // Recorded when the row is stored, from the place it takes in its page.
+            index_shift: 0,
+            unknown1: 0,
+            unknown2: 0,
+            parent_id: ParentId(NonZero::new(parent_id)),
+            position,
+            id: TagId(id),
+            raw_is_category: if is_category {
+                TagOrCategory::IS_CATEGORY
+            } else {
+                0
+            },
+            offsets: OffsetArrayContainer {
+                offsets: MaybeCalculated::Calculated,
+                inner: TagOrCategoryStrings {
+                    name: DeviceSQLString::new(name)?,
+                    unknown: DeviceSQLString::empty(),
+                },
+            },
+        },
+        ROW_SLACK_BYTES,
+    )?;
+    Ok(())
+}
+
+/// Adds the row of the ext table whose purpose is not understood.
+pub fn insert_unknown7<IO: Read + Seek>(db: &mut Database<IO>) -> RekordcrateResult<()> {
+    db.add_row(Unknown7 { bytes: UNKNOWN7 })?;
+    Ok(())
+}
+
 /// Adds the tag categories and tags that tracks can be labelled with.
 pub fn insert_default_tags<IO: Read + Seek>(db: &mut Database<IO>) -> RekordcrateResult<()> {
     for (parent, position, id, is_category, name) in TAGS {
         db.add_row_with_slack(
             TagOrCategory {
-                subtype: Subtype(TAG_SUBTYPE),
+                subtype: Subtype(TagOrCategory::SUBTYPE),
                 // Recorded when the row is stored, from the place it takes in its page.
                 index_shift: 0,
                 unknown1: 0,
@@ -300,7 +340,11 @@ pub fn insert_default_tags<IO: Read + Seek>(db: &mut Database<IO>) -> Rekordcrat
                 parent_id: ParentId(parent.and_then(NonZero::new)),
                 position,
                 id: TagId(id),
-                raw_is_category: if is_category { TAG_IS_CATEGORY } else { 0 },
+                raw_is_category: if is_category {
+                    TagOrCategory::IS_CATEGORY
+                } else {
+                    0
+                },
                 offsets: OffsetArrayContainer {
                     offsets: MaybeCalculated::Calculated,
                     inner: TagOrCategoryStrings {
@@ -318,7 +362,7 @@ pub fn insert_default_tags<IO: Read + Seek>(db: &mut Database<IO>) -> Rekordcrat
 /// Adds the content that Rekordbox writes into every `exportExt.pdb`.
 pub fn insert_ext_defaults<IO: Read + Seek>(db: &mut Database<IO>) -> RekordcrateResult<()> {
     // Rekordbox fills the tables in this order, which decides which page each table claims.
-    db.add_row(Unknown7 { bytes: UNKNOWN7 })?;
+    insert_unknown7(db)?;
     insert_default_tags(db)?;
     Ok(())
 }
