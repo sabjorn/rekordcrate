@@ -478,3 +478,133 @@ fn test_playlists_reject_an_unknown_id() {
     assert!(writer.add_track_to_playlist(unknown, track).is_err());
     assert!(writer.create_playlist(Some(unknown), "Nested").is_err());
 }
+
+/// An export that is opened again must be added to rather than started over.
+#[test]
+fn test_open_adds_to_an_export() {
+    let dir = TempDir::new("open-adds");
+    let first = demo_track("/Contents/One.mp3", "One");
+    let second = demo_track("/Contents/Two.mp3", "Two");
+
+    let mut writer =
+        DeviceExportWriter::create(dir.path(), REFERENCE_DATE).expect("failed to create export");
+    let first_id = writer.add_track(&first).expect("failed to add track");
+    let playlist = writer
+        .create_playlist(None, "Set")
+        .expect("failed to create playlist");
+    assert!(writer
+        .add_track_to_playlist(playlist, first_id)
+        .expect("failed to add track to playlist"));
+    writer.close().expect("failed to close export");
+
+    let mut writer = DeviceExportWriter::open(dir.path()).expect("failed to open export");
+    // The playlist is the one that is already there, not a second one by the same name.
+    let reopened_playlist = writer
+        .playlist_by_name(None, "Set")
+        .expect("the playlist should be in the export");
+    assert_eq!(reopened_playlist, playlist);
+    // A track whose audio file is already on the device keeps the id it was given.
+    assert_eq!(
+        writer.add_track(&first).expect("failed to add track"),
+        first_id
+    );
+    assert!(
+        !writer
+            .add_track_to_playlist(reopened_playlist, first_id)
+            .expect("failed to add track to playlist"),
+        "a track already in the playlist should not be added again"
+    );
+    // A new track is given an id of its own and goes in after the one that is there.
+    let second_id = writer.add_track(&second).expect("failed to add track");
+    assert_ne!(second_id, first_id);
+    assert!(writer
+        .add_track_to_playlist(reopened_playlist, second_id)
+        .expect("failed to add track to playlist"));
+    writer.close().expect("failed to close export");
+
+    assert_eq!(row_count::<TrackRow>(dir.path()), 2);
+    assert_eq!(
+        row_count::<rekordcrate::pdb::PlaylistTreeNode>(dir.path()),
+        1
+    );
+    assert_eq!(row_count::<PlaylistEntry>(dir.path()), 2);
+    // The rows that tracks share are reused rather than added again.
+    assert_eq!(row_count::<Artist>(dir.path()), 1);
+
+    let mut db = DeviceExportLoader::new(dir.path().to_path_buf())
+        .open_pdb_non_persistent()
+        .expect("failed to open database");
+    let mut entries: Vec<(u32, u32)> = db
+        .iter_rows::<PlaylistEntry>()
+        .expect("failed to load entries")
+        .map(|entry| Ok((entry.entry_index, entry.track_id.0)))
+        .collect()
+        .expect("failed to read entries");
+    entries.sort();
+    assert_eq!(entries, vec![(1, first_id.0), (2, second_id.0)]);
+}
+
+/// Two playlists of the same name in different folders must stay apart.
+#[test]
+fn test_playlists_of_the_same_name_stay_apart() {
+    let dir = TempDir::new("same-name");
+    let mut writer =
+        DeviceExportWriter::create(dir.path(), REFERENCE_DATE).expect("failed to create export");
+    let track = writer
+        .add_track(&demo_track("/Contents/One.mp3", "One"))
+        .expect("failed to add track");
+
+    let first_folder = writer
+        .create_playlist_folder(None, "sets")
+        .expect("failed to create folder");
+    let second_folder = writer
+        .create_playlist_folder(None, "archive")
+        .expect("failed to create folder");
+    let in_first = writer
+        .create_playlist(Some(first_folder), "hard")
+        .expect("failed to create playlist");
+    let in_second = writer
+        .create_playlist(Some(second_folder), "hard")
+        .expect("failed to create playlist");
+    assert_ne!(in_first, in_second);
+
+    // A name is only looked up within the folder holding it.
+    assert_eq!(
+        writer.playlist_by_name(Some(first_folder), "hard"),
+        Some(in_first)
+    );
+    assert_eq!(
+        writer.playlist_by_name(Some(second_folder), "hard"),
+        Some(in_second)
+    );
+    assert_eq!(writer.playlist_by_name(None, "hard"), None);
+
+    writer
+        .add_track_to_playlist(in_first, track)
+        .expect("failed to add track to playlist");
+    writer.close().expect("failed to close export");
+
+    // The same holds for an export that is opened again.
+    let writer = DeviceExportWriter::open(dir.path()).expect("failed to open export");
+    assert_eq!(
+        writer.playlist_by_name(Some(first_folder), "hard"),
+        Some(in_first)
+    );
+    assert_eq!(
+        writer.playlist_by_name(Some(second_folder), "hard"),
+        Some(in_second)
+    );
+
+    let mut db = DeviceExportLoader::new(dir.path().to_path_buf())
+        .open_pdb_non_persistent()
+        .expect("failed to open database");
+    let tree = get_playlists(&mut db).expect("failed to read playlists");
+    let names: Vec<String> = tree
+        .iter()
+        .map(|node| match node {
+            PlaylistNode::Folder(folder) => format!("{}/{}", folder.name, folder.children.len()),
+            PlaylistNode::Playlist(playlist) => playlist.name.clone(),
+        })
+        .collect();
+    assert_eq!(names, vec!["sets/1".to_string(), "archive/1".to_string()]);
+}

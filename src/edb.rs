@@ -19,9 +19,9 @@
 //! well, and a row whose type is not known is not found at all. Neither keeps a library from
 //! being read, but it does mean the counts here can exceed what Rekordbox shows.
 
-use crate::anlz::AnalysisPath;
 use crate::pdb::{
-    Album, Artist, Genre, Label, PageType, PlainPageType, PlaylistTreeNode, Row, Track as TrackRow,
+    Album, Artist, Artwork, Genre, Label, PageType, PlainPageType, PlaylistTreeNode, Row,
+    Track as TrackRow,
 };
 use crate::util::{ColorIndex, FileType, RekordcrateResult};
 use binrw::BinRead;
@@ -46,6 +46,9 @@ const ARTIST_TAG: [u8; 2] = [0x00, 0x03];
 const ALBUM_TAG: [u8; 2] = [0x20, 0x03];
 const GENRE_TAG: [u8; 2] = [0xe0, 0x02];
 const LABEL_TAG: [u8; 2] = [0x40, 0x03];
+
+/// Tag of the rows naming the image files that hold the artwork of a track.
+const ARTWORK_TAG: [u8; 2] = [0x20, 0x04];
 
 /// Length of a tag and the index following it.
 ///
@@ -79,6 +82,9 @@ pub struct LibraryTrack {
     pub genre: String,
     /// Name of the record label, or empty if the track names none.
     pub label: String,
+    /// Path of the image file holding the artwork of the track on the machine the library
+    /// belongs to, or empty if the track names none.
+    pub artwork_path: String,
     /// Path of the audio file on the machine the library belongs to.
     pub file_path: String,
     /// Name of the audio file.
@@ -89,6 +95,8 @@ pub struct LibraryTrack {
     pub date_added: String,
     /// Date the track was analyzed.
     pub analyze_date: String,
+    /// Path of the analysis file of the track on the machine the library belongs to.
+    pub analyze_path: String,
     /// Tempo in hundredths of a beat per minute.
     pub tempo: u32,
     /// Playback duration in seconds.
@@ -198,6 +206,12 @@ impl Library {
         &self.tracks
     }
 
+    /// The node of the playlist tree with the given id.
+    #[must_use]
+    pub fn playlist_by_id(&self, id: u32) -> Option<&LibraryPlaylist> {
+        self.playlists.iter().find(|node| node.id == id)
+    }
+
     /// The node of the playlist tree with the given name, if there is exactly one.
     #[must_use]
     pub fn find_playlist(&self, name: &str) -> Option<&LibraryPlaylist> {
@@ -215,20 +229,35 @@ impl Library {
             .unwrap_or_default()
     }
 
+    /// The file that the library holds at a path it recorded, if it is there.
+    ///
+    /// The paths in a library are absolute paths on the machine it belongs to, which a copy of
+    /// the library is not at, so the part below `PIONEER` is taken and looked for in the library
+    /// itself.
+    #[must_use]
+    pub fn file_below_pioneer(&self, recorded_path: &str) -> Option<PathBuf> {
+        let below = recorded_path.split_once("PIONEER/").map(|(_, rest)| rest)?;
+        let path = self.root.join("PIONEER").join(below);
+        path.is_file().then_some(path)
+    }
+
     /// The analysis files that the library holds for a track, if they are there.
     ///
-    /// The library keeps them under its own `PIONEER/USBANLZ` directory, in the place that
-    /// follows from the path of the audio file.
+    /// The track names the one holding the beat grid and the cues, and the others sit beside it
+    /// under the same name. The name is not always the first one: where the paths of two tracks
+    /// lead to the same directory, which happens, Rekordbox counts the name up, so the name has
+    /// to be taken from the track rather than assumed.
+    ///
+    /// The path the track names is a path on the machine the library belongs to, so the file is
+    /// looked for in the library itself.
     #[must_use]
     pub fn analysis_files(&self, track: &LibraryTrack) -> Vec<PathBuf> {
-        let dir = self
-            .root
-            .join("PIONEER")
-            .join("USBANLZ")
-            .join(AnalysisPath::for_audio_path(&track.file_path).relative_dir());
+        let Some(named) = self.file_below_pioneer(&track.analyze_path) else {
+            return Vec::new();
+        };
         ["DAT", "EXT", "2EX"]
             .into_iter()
-            .map(|extension| dir.join(format!("{}.{extension}", AnalysisPath::FILE_STEM)))
+            .map(|extension| named.with_extension(extension))
             .filter(|path| path.is_file())
             .collect()
     }
@@ -262,6 +291,7 @@ struct Names {
     albums: BTreeMap<u32, String>,
     genres: BTreeMap<u32, String>,
     labels: BTreeMap<u32, String>,
+    artwork: BTreeMap<u32, String>,
 }
 
 /// Reads the rows holding the names that a track refers to by id.
@@ -272,8 +302,16 @@ fn read_names(data: &[u8]) -> Names {
         (ALBUM_TAG, PlainPageType::Albums),
         (GENRE_TAG, PlainPageType::Genres),
         (LABEL_TAG, PlainPageType::Labels),
+        (ARTWORK_TAG, PlainPageType::Artwork),
     ] {
-        for offset in tagged_rows(data, tag) {
+        // An artist or album row holds the tag as its first two fields, while the others start
+        // after it.
+        let skip_tag = matches!(
+            page_type,
+            PlainPageType::Genres | PlainPageType::Labels | PlainPageType::Artwork
+        );
+        for tagged in tagged_rows(data, tag) {
+            let offset = if skip_tag { tagged + TAG_SIZE } else { tagged };
             let Some(row) = read_row_at(data, offset, PageType::Plain(page_type)) else {
                 continue;
             };
@@ -290,6 +328,9 @@ fn read_names(data: &[u8]) -> Names {
                 PlainPageType::Labels => row
                     .as_variant::<Label>()
                     .map(|row| (row.id.0, row.name.clone())),
+                PlainPageType::Artwork => row
+                    .as_variant::<Artwork>()
+                    .map(|row| (row.id.0, row.path.clone())),
                 _ => None,
             };
             let Some((id, name)) = named else { continue };
@@ -304,6 +345,7 @@ fn read_names(data: &[u8]) -> Names {
                 PlainPageType::Artists => &mut names.artists,
                 PlainPageType::Albums => &mut names.albums,
                 PlainPageType::Genres => &mut names.genres,
+                PlainPageType::Artwork => &mut names.artwork,
                 _ => &mut names.labels,
             };
             table.insert(id, name);
@@ -367,11 +409,17 @@ fn read_tracks(data: &[u8], names: &Names) -> BTreeMap<u32, LibraryTrack> {
                     .get(&row.label_id.0)
                     .cloned()
                     .unwrap_or_default(),
+                artwork_path: names
+                    .artwork
+                    .get(&row.artwork_id.0)
+                    .cloned()
+                    .unwrap_or_default(),
                 file_path,
                 filename: string(&row.offsets.filename),
                 comment: string(&row.offsets.comment),
                 date_added: string(&row.offsets.date_added),
                 analyze_date: string(&row.offsets.analyze_date),
+                analyze_path: string(&row.offsets.analyze_path),
                 tempo: row.tempo,
                 duration: row.duration,
                 bitrate: row.bitrate,

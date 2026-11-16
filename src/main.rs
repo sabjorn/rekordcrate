@@ -10,7 +10,7 @@ use binrw::BinRead;
 use binrw::BinWrite;
 use clap::{Parser, Subcommand, ValueEnum};
 use fallible_iterator::FallibleIterator;
-use rekordcrate::device::{get_playlists, DeviceExportWriter, Track as DeviceTrack};
+use rekordcrate::device::{get_playlists, DeviceExportWriter, ExportLayout, Track as DeviceTrack};
 use rekordcrate::edb::Library;
 use rekordcrate::pdb::io::Database;
 use rekordcrate::pdb::*;
@@ -42,6 +42,27 @@ enum DumpFormat {
     #[cfg(feature = "json")]
     #[value(name = "json")]
     Json,
+}
+
+/// Which form of a file name to record in an export.
+///
+/// A name holding a character outside ASCII can be written in more than one form, and the forms
+/// look the same but are not the same bytes. A file system is free to store a name in another
+/// form than it was given: macOS stores "ö" on a FAT file system as an "o" followed by a
+/// combining mark, where a library holds it as a single character.
+///
+/// A player was found to want the form the library holds, which is also the form Rekordbox
+/// hashes to work out where the analysis files of a track belong, so that is what is recorded.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+enum NameForm {
+    /// The form the library holds the name in, which is what Rekordbox recorded for the file,
+    /// and what a player was found to look for.
+    #[default]
+    #[value(name = "library")]
+    Library,
+    /// The form the device stores the name in, which is what the directory of the device holds.
+    #[value(name = "device")]
+    Device,
 }
 
 #[derive(Debug, Error)]
@@ -140,6 +161,12 @@ enum Commands {
         /// Playlist to put on the export. May be given more than once.
         #[arg(short = 'p', long = "playlist", value_name = "NAME")]
         playlists: Vec<String>,
+        /// Which form to record the name of a file in, where the device stores a name in
+        /// another form than the library holds it. Players want the form the library holds,
+        /// which is what is recorded unless this says otherwise. Write to an empty directory
+        /// when changing this, as an export records one form or the other.
+        #[arg(long, value_enum, default_value_t = NameForm::Library)]
+        name_form: NameForm,
         /// Directory to write the export to, which must not hold one yet.
         #[arg(value_name = "OUTPUT_DIR")]
         output: Option<PathBuf>,
@@ -571,6 +598,7 @@ fn library(
     path: &Path,
     list: bool,
     playlist_names: &[String],
+    name_form: NameForm,
     output: Option<&Path>,
 ) -> CliResult<()> {
     let library = Library::open(path)?;
@@ -592,23 +620,50 @@ fn library(
     // Resolve the names first, so that nothing is written if one of them is wrong.
     let mut selected = Vec::new();
     for name in playlist_names {
-        let playlist = library
+        let node = library
             .find_playlist(name)
             .ok_or_else(|| CliError::NoSuchPlaylist(name.clone()))?;
-        selected.push(playlist.clone());
+        // A folder holds playlists rather than tracks, so naming one means every playlist in it.
+        let before = selected.len();
+        collect_playlists(&library, node, &mut selected);
+        if node.is_folder() {
+            println!(
+                "{name} is a folder holding {} playlists",
+                selected.len() - before
+            );
+        }
     }
 
-    let mut writer = DeviceExportWriter::create(output, &today())?;
+    // An export that is already there is added to, so that a playlist that has grown does not
+    // mean copying everything again.
+    let existing = ExportLayout::new(output.to_path_buf())
+        .export_pdb()
+        .is_file();
+    let mut writer = if existing {
+        println!("adding to the export already in {}", output.display());
+        DeviceExportWriter::open(output)?
+    } else {
+        DeviceExportWriter::create(output, &today())?
+    };
     let layout = writer.layout().clone();
     let contents = layout.root().join("Contents");
     std::fs::create_dir_all(&contents)?;
 
     let mut missing_audio = 0usize;
     let mut without_analysis = 0usize;
+    let mut added = 0usize;
+    let mut already_there = 0usize;
+    let mut replaced = 0usize;
     for playlist in &selected {
         let tracks = library.playlist_tracks(playlist.id);
+        // The folders the playlist sits in are put on the device as well, so that it is found
+        // where it is in the library.
+        let parent = create_folders_of(&mut writer, &library, playlist)?;
+        let playlist_id = match writer.playlist_by_name(parent, &playlist.name) {
+            Some(playlist_id) => playlist_id,
+            None => writer.create_playlist(parent, &playlist.name)?,
+        };
         println!("{}: {} tracks", playlist.name, tracks.len());
-        let playlist_id = writer.create_playlist(None, &playlist.name)?;
 
         for track in tracks {
             let source = Path::new(&track.file_path);
@@ -618,24 +673,44 @@ fn library(
                 continue;
             }
 
+            let destination = contents.join(&track.filename);
+            // A file that is already on the device is left alone, which is what makes adding to
+            // an export cheap.
+            let was_there = destination.is_file();
+            if copy_unless_present(source, &destination)? && was_there {
+                replaced += 1;
+                eprintln!(
+                    "  warning: copied {} again, as the file on the device had another size",
+                    track.filename
+                );
+            }
+
             // The path the track has on the device, which is also what decides where its
             // analysis files belong.
-            let device_path = format!("/Contents/{}", track.filename);
-            std::fs::copy(source, contents.join(&track.filename))?;
+            let name = match name_form {
+                NameForm::Device => stored_name(&destination)?,
+                NameForm::Library => track.filename.clone(),
+            };
+            let device_path = format!("/Contents/{name}");
+
+            // The artwork keeps the place it has in the library, so that the path recorded for
+            // it is the one the player finds it at.
+            let artwork_path = copy_artwork(&library, track, &layout)?;
 
             let analysis = library.analysis_files(track);
             if analysis.is_empty() {
                 without_analysis += 1;
             }
+            // The paths of two tracks can lead to the same directory, so the name within it is
+            // chosen rather than assumed.
+            let analysis_dir = layout.anlz_dir_for_audio(&device_path);
+            let stem = choose_analysis_stem(&analysis_dir, &device_path)?;
             for file in analysis {
                 let extension = file
                     .extension()
                     .and_then(|extension| extension.to_str())
                     .unwrap_or("DAT");
-                let destination = layout.anlz_file_for_audio(&device_path, extension);
-                if let Some(dir) = destination.parent() {
-                    std::fs::create_dir_all(dir)?;
-                }
+                let destination = analysis_dir.join(format!("{stem}.{extension}"));
                 copy_analysis_file(&file, &destination, &device_path)?;
             }
 
@@ -649,8 +724,9 @@ fn library(
                 comment: track.comment.clone(),
                 date_added: track.date_added.clone(),
                 analyze_date: track.analyze_date.clone(),
-                analyze_path: layout
-                    .anlz_file_for_audio(&device_path, "DAT")
+                artwork_path,
+                analyze_path: analysis_dir
+                    .join(format!("{stem}.DAT"))
                     .strip_prefix(layout.root())
                     .map(|path| format!("/{}", path.display()))
                     .unwrap_or_default(),
@@ -668,12 +744,20 @@ fn library(
                 file_type: track.file_type.clone(),
                 ..Default::default()
             })?;
-            writer.add_track_to_playlist(playlist_id, track_id)?;
+            if writer.add_track_to_playlist(playlist_id, track_id)? {
+                added += 1;
+            } else {
+                already_there += 1;
+            }
         }
     }
     writer.close()?;
 
     println!("wrote an export to {}", output.display());
+    println!("{added} tracks added, {already_there} already on the device");
+    if replaced > 0 {
+        println!("{replaced} audio files were copied again, as the ones on the device differed");
+    }
     if missing_audio > 0 {
         println!("{missing_audio} tracks were left out, as their audio file was not there");
     }
@@ -681,6 +765,192 @@ fn library(
         println!("{without_analysis} tracks have no analysis files in the library");
     }
     Ok(())
+}
+
+/// The name that the device holds a file under, which is not always the name it was given.
+///
+/// A name holding a character outside ASCII can be stored in more than one form, and a file
+/// system is free to pick one: macOS writes the decomposed form to a FAT file system, so a file
+/// given a name holding "ö" is stored under a name holding "o" followed by a combining mark
+/// instead. Both forms find the file again from the machine that wrote it, but a player compares
+/// the name in the directory against the path the database holds, and those have to be the same.
+///
+/// The name is found by looking for the file the path leads to in the directory holding it, so
+/// that whatever the file system stored is what the export records.
+fn stored_name(path: &Path) -> CliResult<String> {
+    let given = || {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_owned()
+    };
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let Some(parent) = path.parent() else {
+            return Ok(given());
+        };
+        let inode = path.metadata()?.ino();
+        for entry in std::fs::read_dir(parent)? {
+            let entry = entry?;
+            if entry.metadata().is_ok_and(|data| data.ino() == inode) {
+                if let Some(name) = entry.file_name().to_str() {
+                    return Ok(name.to_owned());
+                }
+            }
+        }
+    }
+    Ok(given())
+}
+
+/// Copies a file to a device unless the device already holds it, and says whether it copied.
+///
+/// A file of the same size is taken to be the same file. Nothing in a library holds a checksum of
+/// an audio file, so size is as far as this can go, but it does catch the case that matters: a
+/// file left half written by a copy that was interrupted is copied again rather than left as it
+/// is.
+fn copy_unless_present(source: &Path, destination: &Path) -> CliResult<bool> {
+    if let (Ok(source_data), Ok(destination_data)) = (source.metadata(), destination.metadata()) {
+        if source_data.len() == destination_data.len() {
+            return Ok(false);
+        }
+    }
+    if let Some(dir) = destination.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::copy(source, destination)?;
+    Ok(true)
+}
+
+/// Puts the folders that hold a playlist in the library on the device, and returns the one the
+/// playlist belongs in.
+///
+/// A folder that is already on the device is used as it is, so that two playlists from the same
+/// folder end up beside each other rather than in a folder each.
+fn create_folders_of(
+    writer: &mut DeviceExportWriter,
+    library: &Library,
+    playlist: &rekordcrate::edb::LibraryPlaylist,
+) -> CliResult<Option<rekordcrate::pdb::PlaylistTreeNodeId>> {
+    // Walk up to the root of the tree, which gives the folders from the innermost outwards.
+    let mut names = Vec::new();
+    let mut parent_id = playlist.parent_id;
+    while parent_id != 0 {
+        let Some(folder) = library.playlist_by_id(parent_id) else {
+            break;
+        };
+        names.push(folder.name.clone());
+        parent_id = folder.parent_id;
+    }
+
+    let mut parent = None;
+    for name in names.into_iter().rev() {
+        parent = Some(match writer.playlist_by_name(parent, &name) {
+            Some(folder) => folder,
+            None => writer.create_playlist_folder(parent, &name)?,
+        });
+    }
+    Ok(parent)
+}
+
+/// Copies the artwork of a track to a device, and returns the path it has there.
+///
+/// Players look for the artwork of a track at the path the database records, alongside which they
+/// expect the larger version that Rekordbox writes beside it, so both are copied to the place
+/// below `PIONEER/Artwork` that they have in the library.
+fn copy_artwork(
+    library: &Library,
+    track: &rekordcrate::edb::LibraryTrack,
+    layout: &ExportLayout,
+) -> CliResult<String> {
+    let Some(source) = library.file_below_pioneer(&track.artwork_path) else {
+        return Ok(String::new());
+    };
+    let Some(below_artwork) = track.artwork_path.split_once("PIONEER/Artwork/") else {
+        return Ok(String::new());
+    };
+    let destination = layout.artwork_dir().join(below_artwork.1);
+    copy_unless_present(&source, &destination)?;
+
+    // Rekordbox keeps further versions of the same image beside it, which players look for by
+    // name rather than through the database.
+    for suffix in ["_m", "_s"] {
+        let beside = |path: &Path| -> Option<PathBuf> {
+            let stem = path.file_stem()?.to_str()?;
+            let extension = path.extension()?.to_str()?;
+            Some(path.with_file_name(format!("{stem}{suffix}.{extension}")))
+        };
+        if let (Some(from), Some(to)) = (beside(&source), beside(&destination)) {
+            if from.is_file() {
+                copy_unless_present(&from, &to)?;
+            }
+        }
+    }
+
+    Ok(format!("/PIONEER/Artwork/{}", below_artwork.1))
+}
+
+/// Collects the playlists that a node of the playlist tree stands for.
+///
+/// A playlist stands for itself, while a folder stands for every playlist within it, however
+/// deeply it is held.
+fn collect_playlists(
+    library: &Library,
+    node: &rekordcrate::edb::LibraryPlaylist,
+    found: &mut Vec<rekordcrate::edb::LibraryPlaylist>,
+) {
+    if !node.is_folder() {
+        found.push(node.clone());
+        return;
+    }
+    let mut children: Vec<_> = library
+        .playlists()
+        .iter()
+        .filter(|child| child.parent_id == node.id)
+        .collect();
+    children.sort_by_key(|child| (child.sort_order, child.id));
+    for child in children {
+        collect_playlists(library, child, found);
+    }
+}
+
+/// The name to give the analysis files of a track in the directory they belong in.
+///
+/// The directory follows from the path of the audio file, and the paths of two tracks can lead to
+/// the same one, which Rekordbox handles by counting the name up. A name already holding the
+/// analysis of this track is used again, so that writing the same track twice does not leave a
+/// second copy of it.
+fn choose_analysis_stem(dir: &Path, audio_path: &str) -> CliResult<String> {
+    for number in 0..10_000 {
+        let stem = format!("ANLZ{number:04}");
+        let candidate = dir.join(format!("{stem}.DAT"));
+        if !candidate.is_file() {
+            return Ok(stem);
+        }
+        // A file naming this track is the analysis of this track.
+        if analysis_names(&candidate)?.as_deref() == Some(audio_path) {
+            return Ok(stem);
+        }
+    }
+    Err(CliError::MissingArgument(
+        "a free name for the analysis files, as the directory is full",
+    ))
+}
+
+/// The audio file that an analysis file names, if it names one.
+fn analysis_names(path: &Path) -> CliResult<Option<String>> {
+    let data = std::fs::read(path)?;
+    let Ok(anlz) = ANLZ::read(&mut std::io::Cursor::new(data.as_slice())) else {
+        return Ok(None);
+    };
+    Ok(anlz
+        .sections
+        .iter()
+        .find_map(|section| match &section.content {
+            rekordcrate::anlz::Content::Path(content) => Some(content.path.to_string()),
+            _ => None,
+        }))
 }
 
 /// Copies an analysis file to a device, naming the path the audio file has there.
@@ -692,17 +962,26 @@ fn copy_analysis_file(source: &Path, destination: &Path, audio_path: &str) -> Cl
     let data = std::fs::read(source)?;
     let mut cursor = std::io::Cursor::new(data.as_slice());
     let Ok(mut anlz) = ANLZ::read(&mut cursor) else {
-        std::fs::copy(source, destination)?;
+        copy_unless_present(source, destination)?;
         return Ok(());
     };
     if !anlz.set_audio_path(audio_path) {
-        std::fs::copy(source, destination)?;
+        copy_unless_present(source, destination)?;
         return Ok(());
     }
 
     let mut written = std::io::Cursor::new(Vec::new());
     anlz.write(&mut written).map_err(rekordcrate::Error::from)?;
-    std::fs::write(destination, written.into_inner())?;
+    let written = written.into_inner();
+    // The file is rewritten rather than copied, so its size says nothing about the one it came
+    // from, and what the device holds is compared against what would be written instead.
+    if std::fs::read(destination).is_ok_and(|existing| existing == written) {
+        return Ok(());
+    }
+    if let Some(dir) = destination.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(destination, written)?;
     Ok(())
 }
 
@@ -736,8 +1015,9 @@ fn run() -> CliResult<()> {
             path,
             list,
             playlists,
+            name_form,
             output,
-        } => library(path, *list, playlists, output.as_deref())?,
+        } => library(path, *list, playlists, *name_form, output.as_deref())?,
         Commands::ListSettings { path } => list_settings(path)?,
         Commands::ExportPlaylists { path, output_dir } => export_playlists(path, output_dir)?,
         Commands::DumpPDB {
