@@ -1,0 +1,1048 @@
+// Copyright (c) 2026 Jan Holthuis <jan.holthuis@rub.de>
+//
+// This Source Code Form is subject to the terms of the Mozilla Public License, v. 2.0. If a copy
+// of the MPL was not distributed with this file, You can obtain one at
+// http://mozilla.org/MPL/2.0/.
+//
+// SPDX-License-Identifier: MPL-2.0
+
+//! Tests for writing a device export.
+//!
+//! The export that Rekordbox writes for a device without any tracks on it is the reference for
+//! what a written export should look like, so these tests compare against the whole of it.
+
+use fallible_iterator::FallibleIterator;
+use rekordcrate::device::{get_playlists, PlaylistNode, Track};
+use rekordcrate::pdb::{Album, Artist, Genre, Key, Label, PlaylistEntry, RowVariant};
+use rekordcrate::pdb::{Track as TrackRow, TrackId};
+use rekordcrate::setting::{Setting, SettingType};
+use rekordcrate::{DeviceExportLoader, DeviceExportWriter, ExportLayout};
+use std::path::{Path, PathBuf};
+
+/// The export that Rekordbox writes for a device without any tracks on it.
+const REFERENCE_EXPORT: &str = "data/complete_export/empty";
+
+/// The date of the export that the reference was taken from.
+const REFERENCE_DATE: &str = "2022-02-02";
+
+/// Offset of the sequence number in a database header, which counts the edits made to the
+/// database and so cannot match an export written by Rekordbox.
+const SEQUENCE_OFFSET: usize = 0x14;
+
+/// A directory that is removed again when it goes out of scope.
+struct TempDir(PathBuf);
+
+impl TempDir {
+    fn new(name: &str) -> Self {
+        let path =
+            std::env::temp_dir().join(format!("rekordcrate-test-{}-{name}", std::process::id()));
+        // Leftovers from a run that was interrupted would make the test fail for the wrong
+        // reason, because an export is never written over.
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).expect("failed to create temporary directory");
+        Self(path)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Returns the paths of all files in a directory, relative to it, in a stable order.
+fn files_in(dir: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let mut dirs = vec![dir.to_path_buf()];
+    while let Some(current) = dirs.pop() {
+        for entry in std::fs::read_dir(&current).expect("failed to read directory") {
+            let path = entry.expect("failed to read directory entry").path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else {
+                files.push(
+                    path.strip_prefix(dir)
+                        .expect("path is below the directory")
+                        .to_path_buf(),
+                );
+            }
+        }
+    }
+    files.sort();
+    files
+}
+
+/// A written export must hold the files that an export written by Rekordbox holds.
+///
+/// Of the settings files, only `DEVSETTING.DAT` is one of them. The export bundled with this
+/// crate holds all four, but those are the settings of a device, which Rekordbox copies to a
+/// stick when they are changed rather than when an export is written, so a stick that has been
+/// used holds more than an export puts there.
+#[test]
+fn test_create_writes_the_files_of_an_export() {
+    let dir = TempDir::new("files");
+    DeviceExportWriter::create(dir.path(), REFERENCE_DATE)
+        .expect("failed to create export")
+        .close()
+        .expect("failed to close export");
+
+    assert_eq!(
+        files_in(dir.path()),
+        vec![
+            PathBuf::from("PIONEER/DEVSETTING.DAT"),
+            PathBuf::from("PIONEER/rekordbox/export.pdb"),
+            PathBuf::from("PIONEER/rekordbox/exportExt.pdb"),
+        ],
+        "written export does not hold the files of an export"
+    );
+}
+
+/// The databases of a written export must be the ones Rekordbox writes for an export without
+/// tracks, apart from the sequence number that counts edits.
+#[test]
+fn test_create_writes_the_databases_of_an_export() {
+    let dir = TempDir::new("databases");
+    DeviceExportWriter::create(dir.path(), REFERENCE_DATE)
+        .expect("failed to create export")
+        .close()
+        .expect("failed to close export");
+
+    let layout = DeviceExportLoader::new(dir.path().to_path_buf()).layout();
+    let reference = DeviceExportLoader::new(PathBuf::from(REFERENCE_EXPORT)).layout();
+
+    for (written, expected) in [
+        (layout.export_pdb(), reference.export_pdb()),
+        (layout.export_ext_pdb(), reference.export_ext_pdb()),
+    ] {
+        let mut written_bytes = std::fs::read(&written).expect("failed to read written database");
+        let expected_bytes = std::fs::read(&expected).expect("failed to read reference database");
+        assert_eq!(
+            written_bytes.len(),
+            expected_bytes.len(),
+            "{} has the wrong size",
+            written.display()
+        );
+
+        // Take the sequence number out of the comparison rather than skipping the bytes, so that
+        // a difference anywhere else is still reported.
+        written_bytes[SEQUENCE_OFFSET..SEQUENCE_OFFSET + 4]
+            .copy_from_slice(&expected_bytes[SEQUENCE_OFFSET..SEQUENCE_OFFSET + 4]);
+        assert!(
+            written_bytes == expected_bytes,
+            "{} differs from the database Rekordbox writes, at page {:?}",
+            written.display(),
+            written_bytes
+                .chunks(4096)
+                .zip(expected_bytes.chunks(4096))
+                .position(|(ours, theirs)| ours != theirs)
+        );
+    }
+}
+
+/// The settings of a written export must be the settings Rekordbox writes.
+///
+/// An export holds the settings of the device alone, so those are compared against the export
+/// bundled with this crate. The settings of a player, which that export also holds, are not
+/// written, so they are expected to be missing.
+#[test]
+fn test_create_writes_the_settings_of_an_export() {
+    let dir = TempDir::new("settings");
+    DeviceExportWriter::create(dir.path(), REFERENCE_DATE)
+        .expect("failed to create export")
+        .close()
+        .expect("failed to close export");
+
+    let written = DeviceExportLoader::new(dir.path().to_path_buf()).load_settings();
+    let expected = DeviceExportLoader::new(PathBuf::from(REFERENCE_EXPORT)).load_settings();
+
+    // The settings of the device, which the one file an export holds carries.
+    assert_eq!(
+        written.overview_waveform_type,
+        expected.overview_waveform_type
+    );
+    assert_eq!(written.waveform_color, expected.waveform_color);
+    assert_eq!(written.key_display_format, expected.key_display_format);
+    assert_eq!(
+        written.waveform_current_position,
+        expected.waveform_current_position
+    );
+    // The settings of a player are carried by files an export does not write.
+    assert_eq!(written.on_air_display, None);
+    assert_eq!(written.quantize, None);
+    assert_eq!(written.channel_fader_curve, None);
+
+    // The brand is the one the player expects to find, so it is part of the file rather than of
+    // the settings it holds.
+    let layout = DeviceExportLoader::new(dir.path().to_path_buf()).layout();
+    let setting_type = SettingType::DevSetting;
+    let read = |path: PathBuf| {
+        let mut file = std::fs::File::open(&path).expect("failed to open settings file");
+        <Setting as binrw::BinRead>::read_args(&mut file, (setting_type,))
+            .expect("failed to parse settings file")
+    };
+    let written = read(layout.setting_file(setting_type));
+    let expected = read(
+        Path::new(REFERENCE_EXPORT)
+            .join("PIONEER")
+            .join(setting_type.filename()),
+    );
+    assert_eq!(written.brand, expected.brand);
+    assert_eq!(written.data, expected.data);
+}
+
+/// An export must never be written over, so that one that took a long time to collect cannot be
+/// destroyed by accident.
+#[test]
+fn test_create_does_not_overwrite_an_export() {
+    let dir = TempDir::new("overwrite");
+    DeviceExportWriter::create(dir.path(), REFERENCE_DATE)
+        .expect("failed to create export")
+        .close()
+        .expect("failed to close export");
+    let before = std::fs::read(
+        DeviceExportLoader::new(dir.path().to_path_buf())
+            .layout()
+            .export_pdb(),
+    )
+    .expect("failed to read written database");
+
+    let result = DeviceExportWriter::create(dir.path(), REFERENCE_DATE);
+
+    assert!(result.is_err(), "an existing export was written over");
+    let after = std::fs::read(
+        DeviceExportLoader::new(dir.path().to_path_buf())
+            .layout()
+            .export_pdb(),
+    )
+    .expect("failed to read written database");
+    assert_eq!(before, after, "the existing database was modified");
+}
+
+/// Counts the rows of a table in the export written to `dir`.
+fn row_count<RowT: RowVariant>(dir: &Path) -> usize {
+    let mut db = DeviceExportLoader::new(dir.to_path_buf())
+        .open_pdb_non_persistent()
+        .expect("failed to open database");
+    db.iter_rows::<RowT>()
+        .expect("failed to load rows")
+        .count()
+        .expect("failed to count rows")
+}
+
+/// A track with the fields that are worth checking set to something recognizable.
+fn demo_track(path: &str, title: &str) -> Track {
+    Track {
+        file_path: path.to_owned(),
+        title: title.to_owned(),
+        artist: "Loopmasters".to_owned(),
+        album: "Unknown Album".to_owned(),
+        genre: "House".to_owned(),
+        label: "Loopmasters".to_owned(),
+        key: "Dm".to_owned(),
+        comment: "Tracks by www.loopmasters.com".to_owned(),
+        date_added: "2022-02-02".to_owned(),
+        analyze_path: "/PIONEER/USBANLZ/P016/0000875E/ANLZ0000.DAT".to_owned(),
+        analyze_date: "2022-02-02".to_owned(),
+        tempo: 128.0,
+        duration: 172,
+        bitrate: 320,
+        sample_rate: 44100,
+        sample_depth: 16,
+        file_size: 6_899_624,
+        rating: 4,
+        file_type: rekordcrate::util::FileType::Mp3,
+        ..Default::default()
+    }
+}
+
+/// An export takes more tracks than a `u16` could number in steps of 0x20, which is the form the
+/// `index_shift` field of a row takes. The field counts the place a row has in its own page, so
+/// the size of a table is not bound by it.
+#[test]
+fn test_add_track_past_a_table_wide_index_shift() {
+    let dir = TempDir::new("many-tracks");
+    let mut writer =
+        DeviceExportWriter::create(dir.path(), REFERENCE_DATE).expect("failed to create export");
+
+    // One more than the number of rows that 0x20 times a table-wide row index could number.
+    let tracks = usize::from(u16::MAX / 0x20) + 2;
+    for index in 0..tracks {
+        let path = format!("/Contents/Demo Track {index}.mp3");
+        let title = format!("Demo Track {index}");
+        // Each track names its own artist and album, so those tables grow past the limit too.
+        let mut track = demo_track(&path, &title);
+        track.artist = format!("Artist {index}");
+        track.album = format!("Album {index}");
+        writer
+            .add_track(&track)
+            .unwrap_or_else(|error| panic!("track {index} of {tracks} was refused: {error}"));
+    }
+    writer.close().expect("failed to close export");
+
+    assert_eq!(tracks, row_count::<TrackRow>(dir.path()));
+    assert_eq!(tracks, row_count::<Artist>(dir.path()));
+    assert_eq!(tracks, row_count::<Album>(dir.path()));
+}
+
+/// A tempo that cannot be counted in hundredths of a beat per minute is refused rather than
+/// written as some other number.
+#[test]
+fn test_add_track_refuses_a_tempo_that_is_not_a_number() {
+    let dir = TempDir::new("bad-tempo");
+    let mut writer =
+        DeviceExportWriter::create(dir.path(), REFERENCE_DATE).expect("failed to create export");
+    for tempo in [f32::NAN, f32::INFINITY, -1.0, f32::MAX] {
+        let mut track = demo_track("/Contents/Demo Track 1.mp3", "Demo Track 1");
+        track.tempo = tempo;
+        assert!(
+            writer.add_track(&track).is_err(),
+            "a tempo of {tempo} was accepted"
+        );
+    }
+}
+
+/// A track that was added must be readable from the export with the fields it was given.
+#[test]
+fn test_add_track_writes_the_track() {
+    let dir = TempDir::new("add-track");
+    let mut writer =
+        DeviceExportWriter::create(dir.path(), REFERENCE_DATE).expect("failed to create export");
+    let id = writer
+        .add_track(&demo_track("/Contents/Demo Track 1.mp3", "Demo Track 1"))
+        .expect("failed to add track");
+    writer.close().expect("failed to close export");
+
+    assert_eq!(id, TrackId(1));
+    let mut db = DeviceExportLoader::new(dir.path().to_path_buf())
+        .open_pdb_non_persistent()
+        .expect("failed to open database");
+    let tracks: Vec<TrackRow> = db
+        .iter_rows::<TrackRow>()
+        .expect("failed to load tracks")
+        .map(|track| Ok(track.clone()))
+        .collect()
+        .expect("failed to read tracks");
+
+    assert_eq!(tracks.len(), 1);
+    let track = &tracks[0];
+    assert_eq!(track.id, TrackId(1));
+    assert_eq!(
+        track.offsets.title.clone().into_string().unwrap(),
+        "Demo Track 1"
+    );
+    assert_eq!(
+        track.offsets.file_path.clone().into_string().unwrap(),
+        "/Contents/Demo Track 1.mp3"
+    );
+    // The name of the file is held separately from the path it is at.
+    assert_eq!(
+        track.offsets.filename.clone().into_string().unwrap(),
+        "Demo Track 1.mp3"
+    );
+    // The tempo is stored in hundredths of a beat per minute.
+    assert_eq!(track.tempo, 12800);
+    assert_eq!(track.duration, 172);
+    assert_eq!(track.bitrate, 320);
+    assert_eq!(track.sample_rate, 44100);
+    assert_eq!(track.rating, 4);
+    assert_eq!(track.file_size, 6_899_624);
+}
+
+/// The rows that tracks refer to by name must be shared between the tracks that refer to them.
+#[test]
+fn test_add_track_shares_the_rows_tracks_refer_to() {
+    let dir = TempDir::new("share-rows");
+    let mut writer =
+        DeviceExportWriter::create(dir.path(), REFERENCE_DATE).expect("failed to create export");
+    let first = writer
+        .add_track(&demo_track("/Contents/One.mp3", "One"))
+        .expect("failed to add track");
+    let second = writer
+        .add_track(&demo_track("/Contents/Two.mp3", "Two"))
+        .expect("failed to add track");
+    // A track with nothing but a path must not add empty rows for the metadata it lacks.
+    writer
+        .add_track(&Track {
+            file_path: "/Contents/Three.mp3".to_owned(),
+            ..Default::default()
+        })
+        .expect("failed to add track");
+    writer.close().expect("failed to close export");
+
+    assert_ne!(first, second);
+    assert_eq!(row_count::<TrackRow>(dir.path()), 3);
+    assert_eq!(row_count::<Artist>(dir.path()), 1);
+    assert_eq!(row_count::<Album>(dir.path()), 1);
+    assert_eq!(row_count::<Genre>(dir.path()), 1);
+    assert_eq!(row_count::<Label>(dir.path()), 1);
+    assert_eq!(row_count::<Key>(dir.path()), 1);
+}
+
+/// Adding the same audio file twice must not put it in the export twice.
+#[test]
+fn test_add_track_ignores_a_track_that_was_added_before() {
+    let dir = TempDir::new("add-twice");
+    let mut writer =
+        DeviceExportWriter::create(dir.path(), REFERENCE_DATE).expect("failed to create export");
+    let track = demo_track("/Contents/Demo Track 1.mp3", "Demo Track 1");
+    let first = writer.add_track(&track).expect("failed to add track");
+    let second = writer.add_track(&track).expect("failed to add track");
+    writer.close().expect("failed to close export");
+
+    assert_eq!(first, second);
+    assert_eq!(row_count::<TrackRow>(dir.path()), 1);
+}
+
+/// Playlists and the folders holding them must be readable as the tree they were built as.
+#[test]
+fn test_playlists_are_written_as_a_tree() {
+    let dir = TempDir::new("playlists");
+    let mut writer =
+        DeviceExportWriter::create(dir.path(), REFERENCE_DATE).expect("failed to create export");
+    let track = writer
+        .add_track(&demo_track("/Contents/Demo Track 1.mp3", "Demo Track 1"))
+        .expect("failed to add track");
+    let other = writer
+        .add_track(&demo_track("/Contents/Demo Track 2.mp3", "Demo Track 2"))
+        .expect("failed to add track");
+
+    let folder = writer
+        .create_playlist_folder(None, "Sets")
+        .expect("failed to create folder");
+    let playlist = writer
+        .create_playlist(Some(folder), "Opening")
+        .expect("failed to create playlist");
+    let root_playlist = writer
+        .create_playlist(None, "Everything")
+        .expect("failed to create playlist");
+    writer
+        .add_track_to_playlist(playlist, track)
+        .expect("failed to add track to playlist");
+    writer
+        .add_track_to_playlist(playlist, other)
+        .expect("failed to add track to playlist");
+    writer
+        .add_track_to_playlist(root_playlist, track)
+        .expect("failed to add track to playlist");
+    writer.close().expect("failed to close export");
+
+    let mut db = DeviceExportLoader::new(dir.path().to_path_buf())
+        .open_pdb_non_persistent()
+        .expect("failed to open database");
+    let tree = get_playlists(&mut db).expect("failed to read playlists");
+
+    let names: Vec<String> = tree
+        .iter()
+        .map(|node| match node {
+            PlaylistNode::Folder(folder) => format!("folder {}", folder.name),
+            PlaylistNode::Playlist(playlist) => format!("playlist {}", playlist.name),
+        })
+        .collect();
+    assert_eq!(
+        names,
+        vec!["folder Sets".to_string(), "playlist Everything".to_string()]
+    );
+    let PlaylistNode::Folder(sets) = &tree[0] else {
+        panic!("the first node should be a folder: {:?}", tree[0]);
+    };
+    assert_eq!(sets.children.len(), 1);
+    let PlaylistNode::Playlist(opening) = &sets.children[0] else {
+        panic!("the folder should hold a playlist: {:?}", sets.children[0]);
+    };
+    assert_eq!(opening.name, "Opening");
+
+    // The tracks of a playlist are held in the order they were added, counted from one.
+    let mut entries: Vec<(u32, u32, u32)> = db
+        .iter_rows::<PlaylistEntry>()
+        .expect("failed to load playlist entries")
+        .map(|entry| Ok((entry.playlist_id.0, entry.entry_index, entry.track_id.0)))
+        .collect()
+        .expect("failed to read playlist entries");
+    entries.sort();
+    assert_eq!(
+        entries,
+        vec![
+            (opening.id.0, 1, track.0),
+            (opening.id.0, 2, other.0),
+            (root_playlist.0, 1, track.0),
+        ]
+    );
+}
+
+/// A playlist that is not in the export cannot be added to.
+#[test]
+fn test_playlists_reject_an_unknown_id() {
+    let dir = TempDir::new("playlist-id");
+    let mut writer =
+        DeviceExportWriter::create(dir.path(), REFERENCE_DATE).expect("failed to create export");
+    let track = writer
+        .add_track(&demo_track("/Contents/Demo Track 1.mp3", "Demo Track 1"))
+        .expect("failed to add track");
+    let unknown = rekordcrate::pdb::PlaylistTreeNodeId(42);
+
+    assert!(writer.add_track_to_playlist(unknown, track).is_err());
+    assert!(writer.create_playlist(Some(unknown), "Nested").is_err());
+}
+
+/// An export that is opened again must be added to rather than started over.
+#[test]
+fn test_open_adds_to_an_export() {
+    let dir = TempDir::new("open-adds");
+    let first = demo_track("/Contents/One.mp3", "One");
+    let second = demo_track("/Contents/Two.mp3", "Two");
+
+    let mut writer =
+        DeviceExportWriter::create(dir.path(), REFERENCE_DATE).expect("failed to create export");
+    let first_id = writer.add_track(&first).expect("failed to add track");
+    let playlist = writer
+        .create_playlist(None, "Set")
+        .expect("failed to create playlist");
+    assert!(writer
+        .add_track_to_playlist(playlist, first_id)
+        .expect("failed to add track to playlist"));
+    writer.close().expect("failed to close export");
+
+    let mut writer = DeviceExportWriter::open(dir.path()).expect("failed to open export");
+    // The playlist is the one that is already there, not a second one by the same name.
+    let reopened_playlist = writer
+        .playlist_by_name(None, "Set")
+        .expect("the playlist should be in the export");
+    assert_eq!(reopened_playlist, playlist);
+    // A track whose audio file is already on the device keeps the id it was given.
+    assert_eq!(
+        writer.add_track(&first).expect("failed to add track"),
+        first_id
+    );
+    assert!(
+        !writer
+            .add_track_to_playlist(reopened_playlist, first_id)
+            .expect("failed to add track to playlist"),
+        "a track already in the playlist should not be added again"
+    );
+    // A new track is given an id of its own and goes in after the one that is there.
+    let second_id = writer.add_track(&second).expect("failed to add track");
+    assert_ne!(second_id, first_id);
+    assert!(writer
+        .add_track_to_playlist(reopened_playlist, second_id)
+        .expect("failed to add track to playlist"));
+    writer.close().expect("failed to close export");
+
+    assert_eq!(row_count::<TrackRow>(dir.path()), 2);
+    assert_eq!(
+        row_count::<rekordcrate::pdb::PlaylistTreeNode>(dir.path()),
+        1
+    );
+    assert_eq!(row_count::<PlaylistEntry>(dir.path()), 2);
+    // The rows that tracks share are reused rather than added again.
+    assert_eq!(row_count::<Artist>(dir.path()), 1);
+
+    let mut db = DeviceExportLoader::new(dir.path().to_path_buf())
+        .open_pdb_non_persistent()
+        .expect("failed to open database");
+    let mut entries: Vec<(u32, u32)> = db
+        .iter_rows::<PlaylistEntry>()
+        .expect("failed to load entries")
+        .map(|entry| Ok((entry.entry_index, entry.track_id.0)))
+        .collect()
+        .expect("failed to read entries");
+    entries.sort();
+    assert_eq!(entries, vec![(1, first_id.0), (2, second_id.0)]);
+}
+
+/// Two playlists of the same name in different folders must stay apart.
+#[test]
+fn test_playlists_of_the_same_name_stay_apart() {
+    let dir = TempDir::new("same-name");
+    let mut writer =
+        DeviceExportWriter::create(dir.path(), REFERENCE_DATE).expect("failed to create export");
+    let track = writer
+        .add_track(&demo_track("/Contents/One.mp3", "One"))
+        .expect("failed to add track");
+
+    let first_folder = writer
+        .create_playlist_folder(None, "sets")
+        .expect("failed to create folder");
+    let second_folder = writer
+        .create_playlist_folder(None, "archive")
+        .expect("failed to create folder");
+    let in_first = writer
+        .create_playlist(Some(first_folder), "hard")
+        .expect("failed to create playlist");
+    let in_second = writer
+        .create_playlist(Some(second_folder), "hard")
+        .expect("failed to create playlist");
+    assert_ne!(in_first, in_second);
+
+    // A name is only looked up within the folder holding it.
+    assert_eq!(
+        writer.playlist_by_name(Some(first_folder), "hard"),
+        Some(in_first)
+    );
+    assert_eq!(
+        writer.playlist_by_name(Some(second_folder), "hard"),
+        Some(in_second)
+    );
+    assert_eq!(writer.playlist_by_name(None, "hard"), None);
+
+    writer
+        .add_track_to_playlist(in_first, track)
+        .expect("failed to add track to playlist");
+    writer.close().expect("failed to close export");
+
+    // The same holds for an export that is opened again.
+    let writer = DeviceExportWriter::open(dir.path()).expect("failed to open export");
+    assert_eq!(
+        writer.playlist_by_name(Some(first_folder), "hard"),
+        Some(in_first)
+    );
+    assert_eq!(
+        writer.playlist_by_name(Some(second_folder), "hard"),
+        Some(in_second)
+    );
+
+    let mut db = DeviceExportLoader::new(dir.path().to_path_buf())
+        .open_pdb_non_persistent()
+        .expect("failed to open database");
+    let tree = get_playlists(&mut db).expect("failed to read playlists");
+    let names: Vec<String> = tree
+        .iter()
+        .map(|node| match node {
+            PlaylistNode::Folder(folder) => format!("{}/{}", folder.name, folder.children.len()),
+            PlaylistNode::Playlist(playlist) => playlist.name.clone(),
+        })
+        .collect();
+    assert_eq!(names, vec!["sets/1".to_string(), "archive/1".to_string()]);
+}
+
+/// A track must carry the number of times it was played, along with the counter that Rekordbox
+/// keeps beside it.
+///
+/// In an export written by Rekordbox, the string field following the play count holds the count
+/// plus one for all but two of its fifty-three tracks, so that is what is written here.
+#[test]
+fn test_add_track_writes_the_play_count() {
+    let dir = TempDir::new("play-count");
+    let mut writer =
+        DeviceExportWriter::create(dir.path(), REFERENCE_DATE).expect("failed to create export");
+    writer
+        .add_track(&Track {
+            play_count: 9,
+            ..demo_track("/Contents/Played.mp3", "Played")
+        })
+        .expect("failed to add track");
+    writer
+        .add_track(&demo_track("/Contents/Unplayed.mp3", "Unplayed"))
+        .expect("failed to add track");
+    writer.close().expect("failed to close export");
+
+    let mut db = DeviceExportLoader::new(dir.path().to_path_buf())
+        .open_pdb_non_persistent()
+        .expect("failed to open database");
+    let mut rows: Vec<(String, u16, String)> = db
+        .iter_rows::<TrackRow>()
+        .expect("failed to load tracks")
+        .map(|track| {
+            Ok((
+                track.offsets.title.clone().into_string()?,
+                track.play_count,
+                track.offsets.unknown_string2.clone().into_string()?,
+            ))
+        })
+        .collect()
+        .expect("failed to read tracks");
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![
+            ("Played".to_string(), 9, "10".to_string()),
+            ("Unplayed".to_string(), 0, "1".to_string()),
+        ]
+    );
+}
+
+/// The fields of a track row that hold the same value for every track must hold the value that
+/// Rekordbox writes.
+///
+/// `bitmask` is 0x0700 in an export written by the current Rekordbox, where the two older
+/// exports we have hold 0x000c0700, so the value differs between versions rather than between
+/// tracks. `unknown5` is 41 in all three.
+#[test]
+fn test_add_track_writes_the_fields_rekordbox_fixes() {
+    let dir = TempDir::new("fixed-fields");
+    let mut writer =
+        DeviceExportWriter::create(dir.path(), REFERENCE_DATE).expect("failed to create export");
+    writer
+        .add_track(&demo_track("/Contents/One.mp3", "One"))
+        .expect("failed to add track");
+    writer.close().expect("failed to close export");
+
+    let mut db = DeviceExportLoader::new(dir.path().to_path_buf())
+        .open_pdb_non_persistent()
+        .expect("failed to open database");
+    let rows: Vec<(u32, u16, String)> = db
+        .iter_rows::<TrackRow>()
+        .expect("failed to load tracks")
+        .map(|track| {
+            Ok((
+                track.bitmask,
+                track.unknown5,
+                track.offsets.unknown_string3.clone().into_string()?,
+            ))
+        })
+        .collect()
+        .expect("failed to read tracks");
+    assert_eq!(rows, vec![(0x0700, 41, "\u{1}".to_string())]);
+}
+
+/// An album must name its own artist, which is not always the artist of a track on it.
+///
+/// An export written by Rekordbox holds sixty-one artists for fifty-three tracks: every one of
+/// its forty-six albums names an artist, and eight of those are named by no track.
+#[test]
+fn test_add_track_writes_the_artist_of_an_album() {
+    let dir = TempDir::new("album-artist");
+    let mut writer =
+        DeviceExportWriter::create(dir.path(), REFERENCE_DATE).expect("failed to create export");
+    writer
+        .add_track(&Track {
+            artist: "A Remixer".to_owned(),
+            album: "A Compilation".to_owned(),
+            album_artist: "Various Artists".to_owned(),
+            ..demo_track("/Contents/One.mp3", "One")
+        })
+        .expect("failed to add track");
+    writer.close().expect("failed to close export");
+
+    let mut db = DeviceExportLoader::new(dir.path().to_path_buf())
+        .open_pdb_non_persistent()
+        .expect("failed to open database");
+    let artists: Vec<(u32, String)> = db
+        .iter_rows::<Artist>()
+        .expect("failed to load artists")
+        .map(|row| Ok((row.id.0, row.offsets.name.clone().into_string()?)))
+        .collect()
+        .expect("failed to read artists");
+    let albums: Vec<(String, u32)> = db
+        .iter_rows::<Album>()
+        .expect("failed to load albums")
+        .map(|row| Ok((row.offsets.name.clone().into_string()?, row.artist_id.0)))
+        .collect()
+        .expect("failed to read albums");
+
+    // The artist of the track and the artist of the album are both held, as separate rows.
+    let mut names: Vec<&String> = artists.iter().map(|(_, name)| name).collect();
+    names.sort();
+    assert_eq!(names, vec!["A Remixer", "Various Artists"]);
+    // The album names its own artist rather than the artist of the track.
+    let album_artist = artists
+        .iter()
+        .find(|(_, name)| name == "Various Artists")
+        .expect("the artist of the album should be in the export");
+    assert_eq!(albums, vec![("A Compilation".to_string(), album_artist.0)]);
+}
+
+/// Audio files must be laid out the way Rekordbox lays them out.
+///
+/// Every one of the fifty-three tracks of an export written by Rekordbox sits at
+/// `/Contents/<artist>/<album>/<file>`. A track with no album is held in `UnknownAlbum`, a name
+/// is cut to 48 characters, a slash or colon within one becomes an underscore, and a file name is
+/// cut to 48 characters with its extension kept.
+#[test]
+fn test_contents_path_is_laid_out_as_rekordbox_lays_it_out() {
+    let layout = ExportLayout::new(PathBuf::from("/device"));
+    let path = |artist: &str, album: &str, filename: &str| {
+        layout
+            .contents_file(artist, album, filename)
+            .strip_prefix("/device")
+            .expect("the path should be on the device")
+            .to_string_lossy()
+            .to_string()
+    };
+
+    assert_eq!(
+        path(
+            "Dismantle",
+            "Feature Presentation",
+            "Dismantle_-_Feature.aif"
+        ),
+        "Contents/Dismantle/Feature Presentation/Dismantle_-_Feature.aif"
+    );
+    // A track that names no album is held under a name standing for that.
+    assert_eq!(
+        path("TAH", "", "TAH_-_Beat_It_Up.aif"),
+        "Contents/TAH/UnknownAlbum/TAH_-_Beat_It_Up.aif"
+    );
+    // A slash cannot stand in a path, and a colon is replaced as well.
+    assert_eq!(
+        path("V/A", "Various Artists #06: Ruthless", "x.aif"),
+        "Contents/V_A/Various Artists #06_ Ruthless/x.aif"
+    );
+    // A name longer than a path allows is cut.
+    assert_eq!(
+        path(
+            "An Artist",
+            "Serge Geyzel with remixes from Illektrolab & Karsten Pflum [Vinyl]",
+            "x.aif"
+        ),
+        "Contents/An Artist/Serge Geyzel with remixes from Illektrolab & Kar/x.aif"
+    );
+    // A file name is cut as well, keeping the extension so that the file is still an audio file.
+    assert_eq!(
+        path(
+            "An Artist",
+            "An Album",
+            "Diffuse_Reality_Records_-_Serge_Geyzel_with_remixes_from_Illektrolab.aif"
+        ),
+        "Contents/An Artist/An Album/Diffuse_Reality_Records_-_Serge_Geyzel_with_.aif"
+    );
+}
+
+/// Artwork must be named and held where Rekordbox holds it.
+///
+/// An export written by Rekordbox numbers the images `a1` upwards and holds them in directories
+/// of twenty, named with five digits: its fifty-three images run a1 to a19 in `00001`, a20 to
+/// a39 in `00002`, and a40 to a53 in `00003`.
+#[test]
+fn test_artwork_is_held_where_rekordbox_holds_it() {
+    let layout = ExportLayout::new(PathBuf::from("/device"));
+    let path = |id: u32| {
+        layout
+            .artwork_file(rekordcrate::pdb::ArtworkId(id))
+            .strip_prefix("/device")
+            .expect("the path should be on the device")
+            .to_string_lossy()
+            .to_string()
+    };
+
+    assert_eq!(path(1), "PIONEER/Artwork/00001/a1.jpg");
+    assert_eq!(path(19), "PIONEER/Artwork/00001/a19.jpg");
+    assert_eq!(path(20), "PIONEER/Artwork/00002/a20.jpg");
+    assert_eq!(path(39), "PIONEER/Artwork/00002/a39.jpg");
+    assert_eq!(path(40), "PIONEER/Artwork/00003/a40.jpg");
+    assert_eq!(path(53), "PIONEER/Artwork/00003/a53.jpg");
+}
+
+/// A track must name the image of its artwork where the export holds it, not where the library
+/// holds it.
+#[test]
+fn test_add_track_names_the_artwork_of_the_export() {
+    let dir = TempDir::new("artwork-path");
+    let mut writer =
+        DeviceExportWriter::create(dir.path(), REFERENCE_DATE).expect("failed to create export");
+    // Two tracks sharing one image, and a third with its own.
+    for (path, title, artwork) in [
+        (
+            "/Contents/One.mp3",
+            "One",
+            "/library/PIONEER/Artwork/13/tr_1.jpg",
+        ),
+        (
+            "/Contents/Two.mp3",
+            "Two",
+            "/library/PIONEER/Artwork/13/tr_1.jpg",
+        ),
+        (
+            "/Contents/Three.mp3",
+            "Three",
+            "/library/PIONEER/Artwork/13/tr_2.jpg",
+        ),
+    ] {
+        writer
+            .add_track(&Track {
+                artwork_path: artwork.to_owned(),
+                ..demo_track(path, title)
+            })
+            .expect("failed to add track");
+    }
+    writer.close().expect("failed to close export");
+
+    let mut db = DeviceExportLoader::new(dir.path().to_path_buf())
+        .open_pdb_non_persistent()
+        .expect("failed to open database");
+    let mut artwork: Vec<(u32, String)> = db
+        .iter_rows::<rekordcrate::pdb::Artwork>()
+        .expect("failed to load artwork")
+        .map(|row| Ok((row.id.0, row.path.clone().into_string()?)))
+        .collect()
+        .expect("failed to read artwork");
+    artwork.sort();
+    // One row per image, named as the export holds it, and the shared image is held once.
+    assert_eq!(
+        artwork,
+        vec![
+            (1, "/PIONEER/Artwork/00001/a1.jpg".to_string()),
+            (2, "/PIONEER/Artwork/00001/a2.jpg".to_string()),
+        ]
+    );
+}
+
+/// The tags a track is labelled with must be written as Rekordbox writes them.
+///
+/// An export written by Rekordbox holds the tag set of the library, as categories holding tags,
+/// and a row per tag a track is labelled with. Its rows count `index_shift` up in steps of 32,
+/// mark a category with 0x01000000, and hold a 3 in the field beside a link.
+#[test]
+fn test_tags_are_written_as_rekordbox_writes_them() {
+    use rekordcrate::pdb::ext::{TagOrCategory, TrackTag};
+
+    let dir = TempDir::new("tags");
+    let mut writer =
+        DeviceExportWriter::create(dir.path(), REFERENCE_DATE).expect("failed to create export");
+    let track = writer
+        .add_track(&demo_track("/Contents/One.mp3", "One"))
+        .expect("failed to add track");
+
+    let mood = writer
+        .create_tag_category("Mood")
+        .expect("failed to create category");
+    let dark = writer
+        .create_tag(mood, "Dark")
+        .expect("failed to create tag");
+    let light = writer
+        .create_tag(mood, "Light")
+        .expect("failed to create tag");
+    assert_ne!(dark, light);
+    assert!(writer
+        .add_tag_to_track(track, dark)
+        .expect("failed to label the track"));
+    // Labelling a track twice with the same tag must not hold it twice.
+    assert!(!writer
+        .add_tag_to_track(track, dark)
+        .expect("failed to label the track"));
+    writer.close().expect("failed to close export");
+
+    let file = std::fs::File::open(
+        DeviceExportLoader::new(dir.path().to_path_buf())
+            .layout()
+            .export_ext_pdb(),
+    )
+    .expect("failed to open the ext database");
+    let mut db = rekordcrate::pdb::io::Database::open_non_persistent(
+        file,
+        rekordcrate::pdb::DatabaseType::Ext,
+    )
+    .expect("failed to open the ext database");
+
+    let added: Vec<(u32, Option<u32>, bool, String)> = db
+        .iter_rows::<TagOrCategory>()
+        .expect("failed to load tags")
+        .map(|row| {
+            Ok((
+                row.id.0,
+                row.parent_id.0.map(|parent| parent.get()),
+                row.raw_is_category != 0,
+                row.offsets.name.clone().into_string()?,
+            ))
+        })
+        .collect()
+        .expect("failed to read tags");
+    // The export already holds the tag set that Rekordbox puts in every one, so only the rows
+    // added here are of interest.
+    let ours: Vec<_> = added
+        .iter()
+        .filter(|(id, parent, _, _)| *id == mood.0 || *parent == Some(mood.0))
+        .collect();
+    assert_eq!(
+        ours,
+        vec![
+            &(mood.0, None, true, "Mood".to_string()),
+            &(dark.0, Some(mood.0), false, "Dark".to_string()),
+            &(light.0, Some(mood.0), false, "Light".to_string()),
+        ]
+    );
+
+    let links: Vec<(u32, u32, u32)> = db
+        .iter_rows::<TrackTag>()
+        .expect("failed to load the tags of tracks")
+        .map(|row| Ok((row.track_id.0, row.tag_id.0, row.unknown_const)))
+        .collect()
+        .expect("failed to read the tags of tracks");
+    assert_eq!(links, vec![(track.0, dark.0, 3)]);
+}
+
+/// An export must hold the profile of the DJ where Rekordbox holds it.
+#[test]
+fn test_the_dj_profile_is_held_where_rekordbox_holds_it() {
+    let layout = ExportLayout::new(PathBuf::from("/device"));
+    assert_eq!(
+        layout.dj_profile(),
+        PathBuf::from("/device/PIONEER/djprofile.nxs")
+    );
+}
+
+/// An export must hold the tag set it is given, with the ids that set uses.
+///
+/// Rekordbox writes the tag set of the library rather than the set it ships with, and keeps the
+/// ids the library holds: the set of the library this was built against runs to 39 rows with
+/// categories 1, 9, 18 and 27, and the export written by Rekordbox holds exactly those.
+#[test]
+fn test_create_writes_the_tag_set_it_is_given() {
+    use rekordcrate::device::Tag;
+    use rekordcrate::pdb::ext::TagOrCategory;
+
+    let dir = TempDir::new("given-tags");
+    let tags = vec![
+        Tag {
+            id: 27,
+            parent_id: 0,
+            name: "taxonomy".to_owned(),
+            position: 3,
+            is_category: true,
+        },
+        Tag {
+            id: 43,
+            parent_id: 27,
+            name: "fst".to_owned(),
+            position: 13,
+            is_category: false,
+        },
+    ];
+    let mut writer = DeviceExportWriter::create_with_tags(dir.path(), REFERENCE_DATE, &tags)
+        .expect("failed to create export");
+    let track = writer
+        .add_track(&demo_track("/Contents/One.mp3", "One"))
+        .expect("failed to add track");
+    assert!(writer
+        .add_tag_to_track(track, rekordcrate::pdb::ext::TagId(43))
+        .expect("failed to label the track"));
+    writer.close().expect("failed to close export");
+
+    let file = std::fs::File::open(
+        DeviceExportLoader::new(dir.path().to_path_buf())
+            .layout()
+            .export_ext_pdb(),
+    )
+    .expect("failed to open the ext database");
+    let mut db = rekordcrate::pdb::io::Database::open_non_persistent(
+        file,
+        rekordcrate::pdb::DatabaseType::Ext,
+    )
+    .expect("failed to open the ext database");
+    let written: Vec<(u32, Option<u32>, bool, u32, String)> = db
+        .iter_rows::<TagOrCategory>()
+        .expect("failed to load tags")
+        .map(|row| {
+            Ok((
+                row.id.0,
+                row.parent_id.0.map(|parent| parent.get()),
+                row.is_category(),
+                row.position,
+                row.offsets.name.clone().into_string()?,
+            ))
+        })
+        .collect()
+        .expect("failed to read tags");
+
+    // The set it was given, and nothing else: the set Rekordbox ships with is not written.
+    assert_eq!(
+        written,
+        vec![
+            (27, None, true, 3, "taxonomy".to_string()),
+            (43, Some(27), false, 13, "fst".to_string()),
+        ]
+    );
+}

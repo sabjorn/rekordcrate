@@ -37,6 +37,77 @@ use binrw::{
 use modular_bitfield::prelude::*;
 #[cfg(feature = "json")]
 use serde::{Serialize, Serializer};
+use std::path::PathBuf;
+
+/// Where a player looks for the analysis files of a track.
+///
+/// Players have been found to work this out from the path of the audio file rather than reading
+/// the path that the track row of the database holds, so the analysis files of a track have to be
+/// placed where this says even though the database names them separately.
+///
+/// ## References
+///
+/// - <https://github.com/AnnoyingTechnology/rhythmbox-to-pioneer-xdj-exporter/blob/master/posterity/WAVEFORMS.md>
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AnalysisPath {
+    /// Hash of the path of the audio file, which names the directory holding the files.
+    hash: u32,
+    /// Value gathered from the bits of the hash, which names the directory holding that one.
+    group: u16,
+}
+
+impl AnalysisPath {
+    /// Name of the analysis files of a track, without the extension.
+    pub const FILE_STEM: &'static str = "ANLZ0000";
+
+    /// The hash is reduced into this range, which keeps it to eight hex digits.
+    const HASH_MODULUS: u32 = 0x0003_0D43;
+
+    /// Bits of the hash that the group is gathered from, least significant first.
+    const GROUP_BITS: [u32; 7] = [0, 2, 6, 7, 9, 13, 16];
+
+    /// Works out where the analysis files of the track with the given audio file belong.
+    ///
+    /// The path is the path of the audio file on the device, as the track row holds it, e.g.
+    /// `/Contents/Artist/Album/Track.mp3`.
+    #[must_use]
+    pub fn for_audio_path(device_audio_path: &str) -> Self {
+        let hash = Self::hash(device_audio_path);
+        let group = Self::GROUP_BITS
+            .into_iter()
+            .enumerate()
+            .map(|(index, bit)| u16::try_from((hash >> bit) & 1).unwrap_or(0) << index)
+            .sum();
+        Self { hash, group }
+    }
+
+    /// Hashes the path of an audio file, treating it as UTF-16 the way the players do.
+    fn hash(device_audio_path: &str) -> u32 {
+        device_audio_path.encode_utf16().fold(0u32, |hash, unit| {
+            let unit = u32::from(unit);
+            let hash = hash.wrapping_mul(0x5bc9).wrapping_add(unit);
+            hash.wrapping_mul(0x93b5).wrapping_add(unit)
+        }) % Self::HASH_MODULUS
+    }
+
+    /// The hash of the path of the audio file, which names the directory holding the files.
+    #[must_use]
+    pub fn hash_value(&self) -> u32 {
+        self.hash
+    }
+
+    /// The value that names the directory holding the one the files are in.
+    #[must_use]
+    pub fn group(&self) -> u16 {
+        self.group
+    }
+
+    /// The directory holding the analysis files, relative to `PIONEER/USBANLZ`.
+    #[must_use]
+    pub fn relative_dir(&self) -> PathBuf {
+        PathBuf::from(format!("P{:03X}", self.group)).join(format!("{:08X}", self.hash))
+    }
+}
 
 #[cfg(feature = "json")]
 fn serialize_null_wide_string<S>(nws: &NullWideString, serializer: S) -> Result<S::Ok, S::Error>
@@ -1316,6 +1387,55 @@ pub struct ANLZ {
 }
 
 impl ANLZ {
+    /// Changes the path of the audio file that the analysis belongs to.
+    ///
+    /// Analysis files name the audio file they were made for, so copying them to a device means
+    /// changing that name to the path the audio file has there. Returns whether the file named
+    /// one at all, which not every kind of analysis file does.
+    ///
+    /// The sizes recorded in the file and in the section holding the path are adjusted to match
+    /// the new path.
+    pub fn set_audio_path(&mut self, audio_path: &str) -> bool {
+        let Some(section) = self
+            .sections
+            .iter_mut()
+            .find(|section| matches!(section.content, Content::Path(_)))
+        else {
+            return false;
+        };
+        let Content::Path(content) = &mut section.content else {
+            unreachable!("the section was just found by its content")
+        };
+
+        let path = NullWideString::from(audio_path);
+        // The length of the path is counted as part of the header of the section, so the content
+        // of the section is the path alone, with the terminator it ends with. A path so long that
+        // the sizes could not be recorded leaves the file as it was.
+        let Some(sizes) = u32::try_from(path.len())
+            .ok()
+            .and_then(|units| units.checked_add(1))
+            .and_then(|units| units.checked_mul(2))
+            .and_then(|path_size| {
+                let total_size = section.header.size.checked_add(path_size)?;
+                // The file header holds the size of the whole file.
+                let file_size = self
+                    .header
+                    .total_size
+                    .checked_sub(section.header.total_size)?
+                    .checked_add(total_size)?;
+                Some((total_size, file_size))
+            })
+        else {
+            return false;
+        };
+        let (total_size, file_size) = sizes;
+
+        content.path = path;
+        section.header.total_size = total_size;
+        self.header.total_size = file_size;
+        true
+    }
+
     fn parse_sections<R: Read + Seek>(
         reader: &mut R,
         endian: Endian,
@@ -1684,6 +1804,99 @@ mod tests {
                 u16::from(column.energy_mid_third_freq),
                 u16::from(column.energy_top_third_freq),
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod test_set_audio_path {
+    use super::*;
+    use binrw::{BinRead, BinWrite};
+    use std::io::Cursor;
+
+    /// Reads a fixture, names a different audio file, and reads it back.
+    fn rewrite(data: &[u8], audio_path: &str) -> (bool, ANLZ) {
+        let mut anlz = ANLZ::read(&mut Cursor::new(data)).expect("failed to read fixture");
+        let changed = anlz.set_audio_path(audio_path);
+
+        let mut written = Cursor::new(Vec::new());
+        anlz.write(&mut written).expect("failed to write file");
+        let written = written.into_inner();
+        // The size recorded in the file has to match what was written, or a player reading it
+        // would run off the end of a section.
+        assert_eq!(
+            anlz.header.total_size as usize,
+            written.len(),
+            "the file does not have the size it records"
+        );
+        let reread = ANLZ::read(&mut Cursor::new(written.as_slice()))
+            .expect("the written file cannot be read back");
+        (changed, reread)
+    }
+
+    /// The path a file names must be the one it was given, and the analysis must survive.
+    #[test]
+    fn test_set_audio_path_names_the_new_file() {
+        for (name, data) in [
+            (
+                "DAT",
+                include_bytes!("../data/anlz/sweep/ANLZ0000.DAT").as_slice(),
+            ),
+            (
+                "EXT",
+                include_bytes!("../data/anlz/sweep/ANLZ0000.EXT").as_slice(),
+            ),
+        ] {
+            let before = ANLZ::read(&mut Cursor::new(data)).expect("failed to read fixture");
+            let path = "/Contents/Artist/Album/Renamed Track.mp3";
+            let (changed, after) = rewrite(data, path);
+
+            assert!(changed, "the {name} fixture should name an audio file");
+            let named = after
+                .sections
+                .iter()
+                .find_map(|section| match &section.content {
+                    Content::Path(content) => Some(content.path.to_string()),
+                    _ => None,
+                });
+            assert_eq!(
+                named.as_deref(),
+                Some(path),
+                "wrong path in the {name} file"
+            );
+            // Everything else the file holds has to be left as it was.
+            let kinds = |anlz: &ANLZ| {
+                anlz.sections
+                    .iter()
+                    .map(|section| section.header.kind.clone())
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                kinds(&before),
+                kinds(&after),
+                "sections of the {name} file changed"
+            );
+        }
+    }
+
+    /// A shorter path and a longer one both have to leave a file that can be read.
+    #[test]
+    fn test_set_audio_path_handles_any_length() {
+        let data = include_bytes!("../data/anlz/sweep/ANLZ0000.DAT").as_slice();
+        for path in [
+            "/a.mp3",
+            "/Contents/A Rather Long Directory Name/And Another One/With A Long Track Title.aiff",
+        ] {
+            let (changed, after) = rewrite(data, path);
+            assert!(changed);
+            let named = after
+                .sections
+                .iter()
+                .find_map(|section| match &section.content {
+                    Content::Path(content) => Some(content.path.to_string()),
+                    _ => None,
+                });
+            assert_eq!(named.as_deref(), Some(path));
         }
     }
 }
