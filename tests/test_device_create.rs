@@ -248,12 +248,12 @@ fn demo_track(path: &str, title: &str) -> Track {
         analyze_path: "/PIONEER/USBANLZ/P016/0000875E/ANLZ0000.DAT".to_owned(),
         analyze_date: "2022-02-02".to_owned(),
         tempo: 128.0,
-        duration: 172,
+        duration_secs: 172,
         bitrate: 320,
         sample_rate: 44100,
         sample_depth: 16,
         file_size: 6_899_624,
-        rating: 4,
+        rating: rekordcrate::util::Rating::from_stars(4),
         file_type: rekordcrate::util::FileType::Mp3,
         ..Default::default()
     }

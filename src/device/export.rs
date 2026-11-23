@@ -11,6 +11,7 @@
 
 use crate::device::layout::Layout;
 use crate::device::settings::Settings;
+use crate::device::track::Track;
 use crate::pdb::defaults;
 use crate::pdb::ext::{ParentId, TagId, TagOrCategory, TagOrCategoryStrings, TrackTag};
 use crate::pdb::io::Database;
@@ -22,7 +23,7 @@ use crate::pdb::{
     TrackStrings, TrailingName,
 };
 use crate::setting::{Setting, SettingType};
-use crate::util::{ColorIndex, FileType, MaybeCalculated};
+use crate::util::MaybeCalculated;
 use binrw::{BinRead, BinWrite};
 use fallible_iterator::FallibleIterator;
 use std::collections::{HashMap, HashSet};
@@ -110,76 +111,6 @@ impl DeviceExportLoader {
 /// track rows that were given too little space, so this is not only a matter of writing the same
 /// bytes as Rekordbox.
 const TRACK_SLACK_BYTES: u16 = 48;
-
-/// A track to add to a device export.
-///
-/// Only the fields that are known are set; everything else a track row holds is left at what
-/// Rekordbox writes for a track it has nothing to put there. The paths are the paths on the
-/// device, not on the machine writing the export, and the files they name are not touched: a
-/// track is added to the database of an export, and placing its audio alongside is left to the
-/// caller.
-#[derive(Debug, Default, Clone, PartialEq)]
-pub struct Track {
-    /// Path of the audio file on the device, e.g. `/Contents/Artist/Album/Track.mp3`.
-    pub file_path: String,
-    /// Title of the track.
-    pub title: String,
-    /// Name of the artist, which is added to the artists of the export if it is new.
-    pub artist: String,
-    /// Name of the album, which is added to the albums of the export if it is new.
-    pub album: String,
-    /// Name of the artist of the album, which an album names rather than naming the artist of a
-    /// track on it. Falls back to the artist of the track when empty.
-    pub album_artist: String,
-    /// Name of the genre, which is added to the genres of the export if it is new.
-    pub genre: String,
-    /// Name of the record label, which is added to the labels of the export if it is new.
-    pub label: String,
-    /// Musical key, which is added to the keys of the export if it is new.
-    pub key: String,
-    /// Comment shown for the track.
-    pub comment: String,
-    /// Date the track was added to the collection, in `YYYY-MM-DD` form.
-    pub date_added: String,
-    /// Date the track was released, in `YYYY-MM-DD` form.
-    pub release_date: String,
-    /// Name of the remix, if any.
-    pub mix_name: String,
-    /// Path of the analysis file of the track on the device, below `/PIONEER/USBANLZ`.
-    pub analyze_path: String,
-    /// Path of the image file holding the artwork of the track, wherever it is kept. The image
-    /// itself is not touched, as with the audio file, but where it belongs on the device follows
-    /// from it being named here.
-    pub artwork_path: String,
-    /// Date the track was analyzed, in `YYYY-MM-DD` form.
-    pub analyze_date: String,
-    /// Tempo in beats per minute.
-    pub tempo: f32,
-    /// Playback duration in seconds.
-    pub duration: u16,
-    /// Bitrate of the audio file in kbit/s.
-    pub bitrate: u32,
-    /// Sample rate of the audio file in Hz.
-    pub sample_rate: u32,
-    /// Bits per sample of the audio file.
-    pub sample_depth: u16,
-    /// Size of the audio file in bytes.
-    pub file_size: u32,
-    /// Number of the track within its album.
-    pub track_number: u32,
-    /// Number of the disc the track is on.
-    pub disc_number: u16,
-    /// Year the track was released.
-    pub year: u16,
-    /// Rating from zero to five stars.
-    pub rating: u8,
-    /// Number of times the track was played.
-    pub play_count: u16,
-    /// Color the track is labelled with.
-    pub color: ColorIndex,
-    /// Format of the audio file.
-    pub file_type: FileType,
-}
 
 /// A tag that tracks can be labelled with, or a category holding tags.
 ///
@@ -563,8 +494,8 @@ impl DeviceExportWriter {
             track_number: track.track_number,
             disc_number: track.disc_number,
             year: track.year,
-            duration: track.duration,
-            rating: track.rating,
+            duration: track.duration_secs,
+            rating: track.rating.to_byte(),
             play_count: track.play_count,
             color: track.color.clone(),
             file_type: track.file_type.clone(),

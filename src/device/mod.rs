@@ -12,8 +12,10 @@ pub mod export;
 pub mod layout;
 pub mod playlist;
 pub mod settings;
+pub mod track;
 
-pub use crate::device::export::{DeviceExportLoader, DeviceExportWriter, Tag, Track};
+pub use crate::device::export::{DeviceExportLoader, DeviceExportWriter, Tag};
 pub use crate::device::layout::Layout;
 pub use crate::device::playlist::{get_playlists, Playlist, PlaylistFolder, PlaylistNode};
 pub use crate::device::settings::Settings;
+pub use crate::device::track::Track;
