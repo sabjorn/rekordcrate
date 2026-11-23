@@ -16,7 +16,7 @@ use rekordcrate::device::{get_playlists, PlaylistNode, Track};
 use rekordcrate::pdb::{Album, Artist, Genre, Key, Label, PlaylistEntry, RowVariant};
 use rekordcrate::pdb::{Track as TrackRow, TrackId};
 use rekordcrate::setting::{Setting, SettingType};
-use rekordcrate::{DeviceExportLoader, DeviceExportWriter, ExportLayout};
+use rekordcrate::{DeviceExportLoader, DeviceExportWriter, Layout};
 use std::path::{Path, PathBuf};
 
 /// The export that Rekordbox writes for a device without any tracks on it.
@@ -248,12 +248,12 @@ fn demo_track(path: &str, title: &str) -> Track {
         analyze_path: "/PIONEER/USBANLZ/P016/0000875E/ANLZ0000.DAT".to_owned(),
         analyze_date: "2022-02-02".to_owned(),
         tempo: 128.0,
-        duration: 172,
+        duration_secs: 172,
         bitrate: 320,
         sample_rate: 44100,
         sample_depth: 16,
         file_size: 6_899_624,
-        rating: 4,
+        rating: rekordcrate::util::Rating::from_stars(4),
         file_type: rekordcrate::util::FileType::Mp3,
         ..Default::default()
     }
@@ -753,7 +753,7 @@ fn test_add_track_writes_the_artist_of_an_album() {
 /// cut to 48 characters with its extension kept.
 #[test]
 fn test_contents_path_is_laid_out_as_rekordbox_lays_it_out() {
-    let layout = ExportLayout::new(PathBuf::from("/device"));
+    let layout = Layout::new(PathBuf::from("/device"));
     let path = |artist: &str, album: &str, filename: &str| {
         layout
             .contents_file(artist, album, filename)
@@ -808,10 +808,10 @@ fn test_contents_path_is_laid_out_as_rekordbox_lays_it_out() {
 /// a39 in `00002`, and a40 to a53 in `00003`.
 #[test]
 fn test_artwork_is_held_where_rekordbox_holds_it() {
-    let layout = ExportLayout::new(PathBuf::from("/device"));
+    let layout = Layout::new(PathBuf::from("/device"));
     let path = |id: u32| {
         layout
-            .artwork_file(rekordcrate::pdb::ArtworkId(id))
+            .artwork_file(id)
             .strip_prefix("/device")
             .expect("the path should be on the device")
             .to_string_lossy()
@@ -967,7 +967,7 @@ fn test_tags_are_written_as_rekordbox_writes_them() {
 /// An export must hold the profile of the DJ where Rekordbox holds it.
 #[test]
 fn test_the_dj_profile_is_held_where_rekordbox_holds_it() {
-    let layout = ExportLayout::new(PathBuf::from("/device"));
+    let layout = Layout::new(PathBuf::from("/device"));
     assert_eq!(
         layout.dj_profile(),
         PathBuf::from("/device/PIONEER/djprofile.nxs")
