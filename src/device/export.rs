@@ -147,8 +147,6 @@ struct TagIndex {
     next_category_position: u32,
     /// `category id -> next leaf position` (dense from 0 within a category).
     next_leaf_position: HashMap<u32, u32>,
-    /// Per-row counter driving `index_shift` (see [`tag_row`]).
-    next_row_index: u32,
     /// The `(track id, tag id)` junction rows, so a tag is linked to a track only once.
     track_tags: HashSet<(u32, u32)>,
 }
@@ -161,9 +159,6 @@ impl TagIndex {
 
         ext_db.iter_rows::<TagOrCategory>()?.for_each(|tag| {
             index.ids.insert(tag.id.0);
-            index.next_row_index = index
-                .next_row_index
-                .max(u32::from(tag.index_shift) / 0x20 + 1);
             let next_position = tag.position.saturating_add(1);
             if tag.raw_is_category != 0 {
                 index.categories.insert(tag.id.0);
@@ -199,12 +194,6 @@ impl TagIndex {
         self.ids.insert(id);
         self.next_id = id.wrapping_add(1);
         id
-    }
-
-    fn allocate_row_index(&mut self) -> u32 {
-        let row_index = self.next_row_index;
-        self.next_row_index += 1;
-        row_index
     }
 }
 
@@ -705,7 +694,6 @@ impl DeviceExport {
             self.tags.next_category_position,
             TagId(id),
             true,
-            self.tags.allocate_row_index(),
             name,
         )?;
         self.ext_db_mut()?.add_row(row)?;
@@ -781,7 +769,6 @@ impl DeviceExport {
             position,
             TagId(id),
             false,
-            self.tags.allocate_row_index(),
             label,
         )?;
         self.ext_db_mut()?.add_row(row)?;
@@ -1112,9 +1099,6 @@ fn names_by_id<RowT: RowVariant>(
 
 /// Build a category or leaf tag row. `is_category` selects the `raw_is_category` flag
 /// (`0x01000000` for categories, `0` for leaves — confirmed against a real Rekordbox export).
-/// `row_index` is the per-row monotonic counter that drives `index_shift` (`0x20` per row, as
-/// observed on real exports; the field is 16 bits wide, so it wraps after 2048 rows).
-///
 /// Leaf tag ids are small sequential numbers here, not the large random 32-bit values Rekordbox
 /// writes. Whether any player cares is unknown.
 fn tag_row(
@@ -1122,12 +1106,12 @@ fn tag_row(
     position: u32,
     id: TagId,
     is_category: bool,
-    row_index: u32,
     name: &str,
 ) -> Result<TagOrCategory> {
     Ok(TagOrCategory {
         subtype: Subtype(0x0680),
-        index_shift: (row_index.wrapping_mul(0x20)) as u16,
+        // Filled in when the row is stored, from the place it takes in its page.
+        index_shift: 0,
         unknown1: 0,
         unknown2: 0,
         parent_id,
@@ -1147,7 +1131,7 @@ fn tag_row(
 /// Reject a name whose row could not be written, before anything is allocated for it: a row
 /// only fails on [`save`](DeviceExport::save), and one that does can never be removed again.
 fn check_tag_name(name: &str) -> Result<()> {
-    tag_row(ParentId(None), 0, TagId(0), false, 0, name)?
+    tag_row(ParentId(None), 0, TagId(0), false, name)?
         .write_le(&mut Cursor::new(Vec::new()))
         .map_err(|_| Error::TagNameTooLong(name.to_string()))
 }
@@ -2005,13 +1989,16 @@ mod tests {
 
     #[test]
     fn tag_row_encodings() {
-        let cat = tag_row(ParentId(None), 0, TagId(1), true, 0, "C").unwrap();
+        let cat = tag_row(ParentId(None), 0, TagId(1), true, "C").unwrap();
         assert_eq!(cat.raw_is_category, 0x01000000);
-        assert_eq!(cat.index_shift, 0x0000);
 
-        let leaf = tag_row(ParentId(NonZero::new(1)), 0, TagId(2), false, 3, "L").unwrap();
+        let leaf = tag_row(ParentId(NonZero::new(1)), 0, TagId(2), false, "L").unwrap();
         assert_eq!(leaf.raw_is_category, 0);
-        assert_eq!(leaf.index_shift, 0x0060);
+
+        // `index_shift` refers to the place the row takes in its page, so it is filled in when
+        // the row is stored rather than by the row builder.
+        assert_eq!(cat.index_shift, 0);
+        assert_eq!(leaf.index_shift, 0);
     }
 
     const REKORDBOX_PDBS: [&str; 3] = [

@@ -643,13 +643,13 @@ impl Page {
         Self { header, content }
     }
 
-    /// Allocate space for a new row in the page heap and return a function to
-    /// insert the row at the allocated offset. Returns `None` if there is
-    /// insufficient free space in the page.
+    /// Allocate space for a new row in the page heap and return the index the row takes within
+    /// the page along with a function to insert the row at the allocated offset. Returns `None`
+    /// if there is insufficient free space in the page.
     ///
     /// We do this allocate-then-insert dance so that we only take ownership of
     /// the Row once we know we can insert it, avoiding unnecessary copies.
-    pub fn allocate_row<'a>(&'a mut self, bytes: u16) -> Option<impl FnOnce(Row) + 'a> {
+    pub fn allocate_row<'a>(&'a mut self, bytes: u16) -> Option<(u16, impl FnOnce(Row) + 'a)> {
         match self.content {
             PageContent::Index(_) => None,
             PageContent::Data(ref mut dpc) => {
@@ -667,6 +667,12 @@ impl Page {
                 self.header.free_size -= bytes;
                 let row_counts = &mut self.header.packed_row_counts;
                 row_counts.increment_num_rows();
+                // The row takes the last place in the page, which is where its own fields that
+                // refer to that place are taken from.
+                let index_in_page = row_counts.num_rows().saturating_sub(1);
+                // Count the row as written by the write that is in progress, which keeps the sum
+                // of the two counters equal to the number of rows in the page.
+                dpc.header.unknown5 += 1;
                 let (row_group_index, row_subindex) = row_counts.last_row_index().unwrap();
 
                 if dpc.row_groups.get(row_group_index as usize).is_none() {
@@ -680,7 +686,7 @@ impl Page {
 
                 let rows = &mut dpc.rows;
 
-                Some(move |row: Row| {
+                Some((index_in_page, move |row: Row| {
                     let prev_entry = rows.insert(offset, row);
                     if let Some(prev_entry) = prev_entry {
                         panic!(
@@ -690,7 +696,7 @@ impl Page {
                     }
                     row_group.mark_offset_present(row_subindex);
                     row_counts.increment_num_rows_valid();
-                })
+                }))
             }
         }
     }
@@ -701,14 +707,18 @@ impl Page {
 #[derive(Debug, PartialEq, Eq, Clone)]
 #[cfg_attr(feature = "json", derive(Serialize))]
 pub struct DataPageHeader {
-    /// Unknown field.
-    /// Often 1 or 0x1fff; also observed: 8, 27, 22, 17, 2.
+    /// Number of rows that appears to have been written to the page by the most recent write.
+    ///
+    /// Together with `unknown_not_num_rows_large` this adds up to the number of rows in the
+    /// page, in every page of every known export. In the export that Rekordbox writes for a
+    /// database without content, where each page was filled in one go, this holds all the rows
+    /// of the page and `unknown_not_num_rows_large` is zero. In databases that Rekordbox filled
+    /// over time it is usually 1, with the remaining rows counted by the other field.
     ///
     /// According to [@flesniak](https://github.com/flesniak):
     /// > (0->1: 2)
     pub unknown5: u16,
-    /// Unknown field related to the number of rows in the table,
-    /// but not equal to it.
+    /// Number of rows in the page that are not counted by `unknown5`.
     pub unknown_not_num_rows_large: u16,
     /// Unknown field (usually zero).
     pub unknown6: u16,
@@ -847,13 +857,14 @@ pub struct RowGroup {
     pub row_offsets: [u16; Self::MAX_ROW_COUNT],
     /// A bit mask that indicates which rows in this group are actually present.
     pub row_presence_flags: u16,
-    /// Unknown field.
-    /// Often zero, sometimes a multiple of 2, rarely something else.
-    /// When a multiple of 2, the set bit often aligns with the last present row
-    /// in the group, so maybe this is a bitset like the flags.
+    /// A bit mask that appears to indicate which rows in this group were written by the most
+    /// recent write to the page.
     ///
-    /// E.g. for a full Artist rowgroup, this is usually zero.
-    /// For the last Artist rowgroup in the page with flags 0x003f, this is often 0x0020.
+    /// In the export that Rekordbox writes for a database without content, where every page was
+    /// filled in one go, this is equal to `row_presence_flags` for every row group. In databases
+    /// that Rekordbox filled over time, the row groups that were already full are zero and only
+    /// the group that was last written has bits set, e.g. a group with flags 0x000f has 0x0008
+    /// here, the bit of the row that was added last.
     pub unknown: u16,
 
     // Seek to the start of the row group to prepare for reading the next one.
@@ -916,6 +927,8 @@ impl RowGroup {
     /// Mark an inserted row offset as present.
     fn mark_offset_present(&mut self, subindex: u16) {
         self.row_presence_flags |= 1 << subindex;
+        // The row was written by the write that is in progress.
+        self.unknown |= 1 << subindex;
     }
 }
 
@@ -2273,6 +2286,38 @@ pub enum Row {
     /// The row format (and also its size) is unknown, which means it can't be parsed.
     #[br(pre_assert(matches!(page_type, PageType::Unknown(_))))]
     Unknown,
+}
+
+/// Step by which the `index_shift` field of a row grows from one row of a page to the next.
+pub(crate) const INDEX_SHIFT_STEP: u16 = 0x20;
+
+impl Row {
+    /// Records the place the row takes in its page, in the field that holds it.
+    ///
+    /// Rows of several tables carry an `index_shift` field that refers to the place the row takes
+    /// within its own page, rather than within its table: in every data page of every export
+    /// known to us the field holds [`INDEX_SHIFT_STEP`] times that place, restarting from zero in
+    /// each page of the table. A row type that has no such field is left alone.
+    pub(crate) fn set_index_shift(&mut self, index_shift: u16) {
+        match self {
+            Row::Plain(row) => row.set_index_shift(index_shift),
+            Row::Ext(row) => row.set_index_shift(index_shift),
+            Row::Unknown => (),
+        }
+    }
+}
+
+impl PlainRow {
+    /// Records the place the row takes in its page, as described for [`Row::set_index_shift`].
+    fn set_index_shift(&mut self, index_shift: u16) {
+        match self {
+            PlainRow::Album(row) => row.index_shift = index_shift,
+            PlainRow::Artist(row) => row.index_shift = index_shift,
+            PlainRow::History(row) => row.index_shift = index_shift,
+            PlainRow::Track(row) => row.index_shift = index_shift,
+            _ => (),
+        }
+    }
 }
 
 impl Row {
